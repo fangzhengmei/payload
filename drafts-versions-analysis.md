@@ -477,7 +477,7 @@ const lockDurationInMilliseconds = lockDuration * 1000
 
 #### 3.2.1 关键发现：两条链路的默认行为完全不同
 
-**深入代码追踪后，发现了一个重要的差异：
+**深入代码追踪后，发现了一个重要的差异：**
 
 | 链路类型 | API 入口文件 | overrideLock 处理方式 | 默认行为 |
 |---------|-----------|----------------------|---------|
@@ -598,7 +598,7 @@ overrideLock = true,  // 函数参数默认值
 
 #### 3.2.5 各操作的锁检查行为汇总
 
-**服务端调用 `checkDocumentLockStatus` 的操作：
+**服务端调用 `checkDocumentLockStatus` 的操作：**
 
 | 操作 | 集合/全局 | REST API 默认行为 | Local API 默认行为 |
 |------|-----------|------------------|-------------------|
@@ -607,7 +607,7 @@ overrideLock = true,  // 函数参数默认值
 | **deleteByID** | 集合 | 需查看 endpoint | 需查看 endpoint |
 | **delete** | 集合 | 需查看 endpoint | 需查看 endpoint |
 
-**Admin UI 的实际保护机制：
+**Admin UI 的实际保护机制：**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
