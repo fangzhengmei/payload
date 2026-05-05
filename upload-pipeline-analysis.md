@@ -21,15 +21,19 @@
     ├── 裁剪处理 (cropImage.ts)
     └── 多尺寸变体生成 (createImageSizes.ts)
     ↓
-[3] 本地文件保存 (saveBufferToFile.ts / uploadFiles.ts)
+[3] 本地文件保存 (可选，取决于 disableLocalStorage)
+    ├── 如果 disableLocalStorage=false: 保存到本地磁盘
+    └── 如果 disableLocalStorage=true: 仅保留 Buffer 在内存中
     ↓
 [4] 云端存储上传 (plugin-cloud-storage afterChange hook)
+    ├── 直接从 req.file.data 和 req.payloadUploadSizes 读取 Buffer
     ├── 主文件上传
     └── 各尺寸变体上传
     ↓
 [5] URL 生成与数据持久化
-    ├── generateFilePathOrURL.ts (本地)
-    └── adapter.generateURL (云端)
+    ├── beforeChange: 首写时生成 URL
+    ├── afterRead: 读取时动态补全 URL
+    └── staticHandler: 代理访问时处理
 ```
 
 ### 1.2 关键模块位置
