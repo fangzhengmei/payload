@@ -565,47 +565,68 @@ export const s3Storage = (s3StorageOptions) => (incomingConfig) => {
 
 ## 四、远端存储写入流程
 
-### 4.1 完整写入时序
+### 4.1 完整写入时序（基于 create.ts 源码）
+
+根据 `packages/payload/src/collections/operations/create.ts` 的源码，正确的执行顺序如下：
 
 ```
-┌─────────┐     ┌─────────────┐     ┌──────────────────┐     ┌─────────────┐
-│  Admin  │────▶│   Payload   │────▶│ generateFileData │────▶│   Sharp     │
-│  (UI)   │     │   Server    │     │                  │     │ (处理图片)  │
-└─────────┘     └─────────────┘     └──────────────────┘     └─────────────┘
-                                                      │
-                                                      ▼
-                                              ┌───────────────┐
-                                              │  保存到临时    │
-                                              │ Buffer/文件   │
-                                              └───────┬───────┘
-                                                      │
-                                                      ▼
-                                              ┌───────────────┐
-                                              │  数据库写入    │◀── beforeChange
-                                              │  (首次)       │    生成 URL 字段
-                                              └───────┬───────┘
-                                                      │
-                                                      ▼
-                                              ┌───────────────┐
-                                              │  afterChange  │
-                                              │    Hook       │
-                                              └───────┬───────┘
-                                                      │
-                    ┌─────────────────────────────────┼─────────────────────────────────┐
-                    ▼                                 ▼                                 ▼
-           ┌────────────────┐               ┌────────────────┐               ┌────────────────┐
-           │  主文件上传    │               │ size_1 上传    │               │ size_N 上传    │
-           │  (handleUpload)│               │  (handleUpload)│               │  (handleUpload)│
-           └────────┬───────┘               └────────┬───────┘               └────────┬───────┘
-                    │                                 │                                 │
-                    └─────────────────────────────────┼─────────────────────────────────┘
-                                                      ▼
-                                              ┌───────────────┐
-                                              │  数据库更新    │
-                                              │ (二次写入)     │
-                                              │  存储元数据    │
-                                              └───────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│  阶段 1: 图片处理 & Hook 执行 (首次写库之前)                                  │
+└────────────────────────────────────────────────────────────────────────────┘
+
+1. beforeOperation - Collection 级别 Hook
+         ↓
+2. Access 权限检查
+         ↓
+3. generateFileData (关键：图片处理)
+   ├── 调用 createImageSizes 生成各尺寸变体
+   ├── Buffer 存储到:
+   │     ├── req.file.data = 主文件 Buffer
+   │     └── req.payloadUploadSizes = { sizeName: Buffer, ... }
+   └── 返回: { data: newFileData, files: filesToUpload }
+         ↓
+4. beforeValidate - Fields → Collection
+         ↓
+5. beforeChange - Collection 级别 Hook
+         ↓
+6. beforeChange - Fields 级别 Hook (关键：URL 首写)
+   ├── url 字段的 beforeChange hook 执行
+   ├── 根据配置生成 URL
+   └── 结果存储到 resultWithLocales（即将写入数据库的数据）
+         ↓
+7. uploadFiles (条件执行)
+   └── 仅当 !disableLocalStorage 时，保存到本地磁盘
+         ↓
+8. db.create (首次写库)
+   └── 将 resultWithLocales 写入数据库
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│  阶段 2: 读取补全 & 云端上传 (首次写库之后)                                   │
+└────────────────────────────────────────────────────────────────────────────┘
+
+9. afterRead - Fields → Collection (关键：URL 读取补全)
+   ├── url 字段的 afterRead hook 执行
+   ├── 动态补全 URL（如追加 ?prefix=... 参数）
+   └── 结果不存储到数据库，只在返回时生效
+         ↓
+10. afterChange - Fields 级别 Hook
+          ↓
+11. afterChange - Collection 级别 Hook (关键：云端上传)
+    ├── cloud-storage 的 hook 执行
+    ├── 从 req.file.data 和 req.payloadUploadSizes 读取 Buffer
+    ├── 调用 adapter.handleUpload 上传到云端
+    └── 如果 adapter 返回元数据，可能执行二次写库
+          ↓
+12. afterOperation - Collection 级别 Hook
 ```
+
+**关键修正点**：
+
+| 之前的错误描述 | 正确描述 |
+|---------------|---------|
+| `beforeChange` 在首次写库**之后**执行 | `beforeChange` 在首次写库**之前**执行，用于生成 URL 并写入数据库 |
+| `afterRead` 在 `afterChange` **之后**执行 | `afterRead` 在 `afterChange` **之前**执行，用于动态补全 URL |
+| Buffer 在 `afterChange` 之后才可用 | Buffer 在 `generateFileData` 阶段就已生成，存储在 `req.file.data` 和 `req.payloadUploadSizes` |
 
 ### 4.2 核心 Hook 解析
 
@@ -847,86 +868,49 @@ export function getFileKey({
 
 ---
 
-## 五、访问链接生成机制
+## 五、访问链接生成机制（三个时机）
 
-PayloadCMS 有两套 URL 生成机制，分别适用于 **本地存储** 和 **云端存储**。
-
-### 5.1 本地存储 URL 生成
-
-**文件**: `packages/payload/src/uploads/generateFilePathOrURL.ts`
-
-```typescript
-export function generateFilePathOrURL({
-  collectionSlug, config, filename, relative, serverURL, urlOrPath,
-}: {
-  collectionSlug: string
-  config: Config
-  filename?: string
-  relative: boolean
-  serverURL?: string
-  urlOrPath: string | undefined
-}): null | string {
-  
-  // 1. 如果已有外部 URL，直接返回
-  if (urlOrPath) {
-    if (!urlOrPath.startsWith('/') && !urlOrPath.startsWith(serverURL || '')) {
-      return urlOrPath  // 外部 URL: "https://cdn.example.com/..."
-    }
-  }
-
-  // 2. 本地文件：构建 API 路由 URL
-  if (filename) {
-    return formatAdminURL({
-      apiRoute: config.routes?.api || '',
-      path: `/${collectionSlug}/file/${encodeURIComponent(filename)}`,
-      relative,
-      serverURL: config.serverURL,
-    })
-  }
-
-  return null
-}
-```
-
-**生成的 URL 格式**:
-- `relative=false`: `{serverURL}/api/{collection}/file/{filename}`
-  - 示例: `https://cms.example.com/api/media/file/photo.jpg`
-- `relative=true`: `/api/{collection}/file/{filename}`
-  - 示例: `/api/media/file/photo.jpg`
-
-### 5.2 云端存储 URL 生成
-
-云端存储有 **三种 URL 生成策略**，优先级从高到低：
+PayloadCMS 的 URL 生成分为 **三个不同的时机**，每个时机有不同的用途和行为：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  优先级 1: generateFileURL (用户自定义，集合级别)                 │
-│  ─────────────────────────────────────────────────────────────  │
-│  配置位置: CollectionOptions.generateFileURL                      │
-│  用途: 完全控制 URL 生成逻辑，如自定义 CDN 域名、路径规则等        │
-└─────────────────────────────────────────────────────────────────┘
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  优先级 2: disablePayloadAccessControl + adapter.generateURL    │
-│  ─────────────────────────────────────────────────────────────  │
-│  配置位置: adapter.generateURL (适配器内置)                        │
-│  触发条件: disablePayloadAccessControl === true                   │
-│  用途: 直接使用云存储的公开 URL，绕过 Payload 访问控制             │
-└─────────────────────────────────────────────────────────────────┘
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  优先级 3: Payload 代理 URL (默认)                                │
-│  ─────────────────────────────────────────────────────────────  │
-│  格式: /api/{collection}/file/{filename}?prefix={prefix}         │
-│  处理: staticHandler 负责从云存储读取并返回                        │
-│  优势: 可应用 Payload 的访问控制、权限检查等                        │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│  时机 1: beforeChange Hook (首写/写入数据库前)                            │
+│  ───────────────────────────────────────────────────────────────────────  │
+│  触发: 数据库写入之前                                                       │
+│  位置: url 字段的 hooks.beforeChange                                       │
+│  用途: 生成 URL 并存储到数据库                                              │
+│  特点: 只在创建/更新时执行一次，结果持久化                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  时机 2: afterRead Hook (读取补全/运行时)                                  │
+│  ───────────────────────────────────────────────────────────────────────  │
+│  触发: 从数据库读取数据时                                                   │
+│  位置: url 字段的 hooks.afterRead                                          │
+│  用途: 动态生成/补全 URL，可能不存储到数据库                                 │
+│  特点: 每次读取都执行，可动态计算（如签名 URL、追加 prefix 参数）            │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  时机 3: staticHandler (代理访问/请求时)                                   │
+│  ───────────────────────────────────────────────────────────────────────  │
+│  触发: 用户访问 /api/{collection}/file/{filename} 时                      │
+│  位置: upload.handlers 数组                                                │
+│  用途: 实际文件访问处理                                                     │
+│  特点: 可能代理返回文件，或重定向到云端 URL，或返回签名 URL                 │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 5.2.1 Hook 中的 URL 生成逻辑
+### 5.1 时机 1: beforeChange Hook（首写/写入数据库前）
 
-**beforeChange Hook**: `packages/plugin-cloud-storage/src/hooks/beforeChange.ts`
+**文件**: `packages/plugin-cloud-storage/src/hooks/beforeChange.ts`
 
+**触发时机**: 
+- 创建文档时 (`operation: 'create'`)
+- 更新文档时 (`operation: 'update'`)
+- 在数据库写入**之前**执行
+
+**行为**:
 ```typescript
 export const getBeforeChangeHook = ({
   adapter, collection, disablePayloadAccessControl, generateFileURL, size,
@@ -953,14 +937,30 @@ export const getBeforeChangeHook = ({
       prefix,
     })
   }
-  // 优先级 3: 保持原值（后续由 afterRead 处理）
+  // 优先级 3: 保持原值（可能是 Payload 代理 URL 格式）
+  // 不做任何修改，value 保持不变
 
   return url
 }
 ```
 
-**afterRead Hook**: `packages/plugin-cloud-storage/src/hooks/afterRead.ts`
+**URL 策略优先级（首写时）**:
 
+| 优先级 | 策略 | 触发条件 | 结果存储 |
+|--------|------|---------|---------|
+| 1 | `generateFileURL` | 用户配置了此函数 | ✅ 存储到数据库 |
+| 2 | `adapter.generateURL` | `disablePayloadAccessControl === true` | ✅ 存储到数据库 |
+| 3 | Payload 默认 URL | 其他情况 | ⚠️ 可能是代理格式，后续由 afterRead 补全 |
+
+### 5.2 时机 2: afterRead Hook（读取补全/运行时）
+
+**文件**: `packages/plugin-cloud-storage/src/hooks/afterRead.ts`
+
+**触发时机**: 
+- 从数据库读取数据时（每次查询、每次列表获取）
+- 在数据返回给用户**之前**执行
+
+**行为**:
 ```typescript
 export const getAfterReadHook = ({
   adapter, collection, disablePayloadAccessControl, generateFileURL, size,
@@ -971,14 +971,18 @@ export const getAfterReadHook = ({
   let url = value
 
   if (filename) {
+    // 优先级 1: 用户自定义 generateFileURL
     if (generateFileURL) {
-      // 优先级 1: 自定义
       url = await generateFileURL({ collection, filename, prefix, size })
-    } else if (disablePayloadAccessControl && adapter.generateURL) {
-      // 优先级 2: 适配器 URL
+    } 
+    // 优先级 2: 禁用访问控制时使用适配器生成的 URL
+    else if (disablePayloadAccessControl && adapter.generateURL) {
       url = await adapter.generateURL({ collection, data, filename, prefix })
-    } else if (url && prefix) {
-      // 优先级 3: 代理 URL，追加 prefix 查询参数
+    } 
+    // 优先级 3: 代理 URL 模式，追加 prefix 查询参数
+    else if (url && prefix) {
+      // 关键点: 数据库中存储的 URL 可能没有 prefix
+      // afterRead 时动态追加 ?prefix=... 参数
       const separator = url.includes('?') ? '&' : '?'
       url = `${url}${separator}prefix=${encodeURIComponent(prefix)}`
     }
@@ -988,125 +992,247 @@ export const getAfterReadHook = ({
 }
 ```
 
-#### 5.2.2 S3 URL 生成实现
+**afterRead 的关键作用**:
 
-**文件**: `packages/storage-s3/src/generateURL.ts`
+1. **动态 URL 生成**: 对于签名 URL、CDN URL 等，每次读取时重新生成
+2. **prefix 参数补全**: 代理 URL 模式下，数据库存储的是 `/api/media/file/photo.jpg`，afterRead 时动态追加 `?prefix=uploads/`
+3. **运行时计算**: URL 可能不存储在数据库，而是每次读取时计算
 
-```typescript
-export function generateURL({
-  bucket, collectionPrefix = '', endpoint, filename, prefix,
-  useCompositePrefixes = false,
-}: GenerateURLArgs): string {
-  
-  // 1. 计算文件 Key
-  const { fileKey: rawFileKey } = getFileKey({
-    collectionPrefix,
-    docPrefix: prefix,
-    filename,
-    useCompositePrefixes,
-  })
+**示例场景**:
 
-  // 2. URL 编码文件名部分（保留路径结构）
-  const dir = path.posix.dirname(rawFileKey)
-  const encodedFilename = encodeURIComponent(path.posix.basename(rawFileKey))
-  const fileKey = dir === '.' ? encodedFilename : path.posix.join(dir, encodedFilename)
-
-  // 3. 构建完整 URL
-  const stringifiedEndpoint = typeof endpoint === 'string' 
-    ? endpoint 
-    : endpoint?.toString()
-  
-  return `${stringifiedEndpoint}/${bucket}/${fileKey}`
-}
 ```
-
-**示例输出**:
-- 输入: 
-  - `endpoint: 'https://s3.us-east-1.amazonaws.com'`
-  - `bucket: 'my-bucket'`
-  - `collectionPrefix: 'uploads/'`
-  - `prefix: '2024/05/'`
-  - `filename: 'my photo.jpg'`
-  - `useCompositePrefixes: true`
-- 输出: 
-  - `https://s3.us-east-1.amazonaws.com/my-bucket/uploads/2024/05/my%20photo.jpg`
-
-#### 5.2.3 GCS URL 生成（签名 URL）
-
-**文件**: `packages/storage-gcs/src/generateURL.ts`
-
-GCS 支持生成带过期时间的签名 URL：
-
-```typescript
-export async function generateSignedURL({
-  bucket, client, collectionPrefix = '', docPrefix = '',
-  filename, useCompositePrefixes = false, expiresIn = 900,  // 默认 15 分钟
-}: GenerateSignedURLArgs): Promise<string> {
-  
-  const { fileKey } = getFileKey({
-    collectionPrefix, docPrefix, filename, useCompositePrefixes,
-  })
-
-  const bucketInstance = client.bucket(bucket)
-  const file = bucketInstance.file(fileKey)
-
-  const [url] = await file.getSignedUrl({
-    action: 'read',
-    expires: expiresIn,
-  })
-
-  return url
-}
-```
-
-### 5.3 静态文件处理器 (staticHandler)
-
-当使用代理模式时，请求会经过 `staticHandler`：
-
-**S3 getFile 实现**: `packages/storage-s3/src/getFile.ts`
-
-```typescript
-export function getFile({
-  bucket, client, collection, collectionPrefix, filename,
-  incomingHeaders, prefixQueryParam, req, signedDownloads,
-  useCompositePrefixes,
-}: GetFileArgs): Response | Promise<Response> {
-  
-  // 1. 处理签名下载
-  if (signedDownloads) {
-    return generateSignedURLResponse({
-      // ... 生成 302 重定向到签名 URL
-    })
+数据库中存储的文档:
+{
+  filename: 'photo.jpg',
+  prefix: 'uploads/2024/05/',
+  url: '/api/media/file/photo.jpg',  // 没有 prefix 参数
+  sizes: {
+    thumbnail: {
+      filename: 'photo-400x300.jpg',
+      url: '/api/media/file/photo-400x300.jpg'
+    }
   }
+}
 
-  // 2. 代理模式：从 S3 读取并返回
+afterRead 执行后返回给用户的数据:
+{
+  filename: 'photo.jpg',
+  prefix: 'uploads/2024/05/',
+  url: '/api/media/file/photo.jpg?prefix=uploads%2F2024%2F05%2F',  // 追加了 prefix
+  sizes: {
+    thumbnail: {
+      filename: 'photo-400x300.jpg',
+      url: '/api/media/file/photo-400x300.jpg?prefix=uploads%2F2024%2F05%2F'
+    }
+  }
+}
+```
+
+### 5.3 时机 3: staticHandler（代理访问/请求时）
+
+**文件**: 各适配器的 `getFile.ts` 或 `staticHandler` 实现
+
+**触发时机**: 
+- 用户实际访问文件 URL 时
+- 如 `GET /api/media/file/photo.jpg?prefix=uploads/`
+
+**行为模式**:
+
+staticHandler 有三种常见实现模式：
+
+#### 模式 A: 代理模式（默认，可应用访问控制）
+
+```typescript
+// S3 getFile.ts 简化版
+export function getFile({
+  bucket, client, filename, prefixQueryParam, useCompositePrefixes,
+}: GetFileArgs): Response {
+  
+  // 1. 计算文件 Key（使用 URL 中的 prefix 查询参数）
   const { fileKey } = getFileKey({
     collectionPrefix,
-    docPrefix: prefixQueryParam,
+    docPrefix: prefixQueryParam,  // 从查询参数获取 prefix
     filename,
     useCompositePrefixes,
   })
 
+  // 2. 从云存储获取文件
   const getObjectRequest = client.getObject({
     Bucket: bucket,
     Key: fileKey,
   })
 
-  // 3. 转换 S3 响应为 Web Response
+  // 3. 代理返回给客户端
   return new Response(
     getObjectRequest.Body?.transformToWebStream(),
     {
       status: 200,
       headers: {
         'Content-Type': getObjectRequest.ContentType || 'application/octet-stream',
-        'Content-Length': String(getObjectRequest.ContentLength || 0),
-        'ETag': getObjectRequest.ETag || '',
-        'Last-Modified': getObjectRequest.LastModified?.toUTCString() || '',
+        // ...
       },
     }
   )
 }
 ```
+
+**代理模式的优势**:
+- 可应用 Payload 的访问控制（权限检查、API 密钥验证等）
+- 可隐藏真实云存储 URL
+- 可添加自定义响应头
+
+#### 模式 B: 预签名 URL 重定向
+
+```typescript
+// 启用 signedDownloads 时
+if (signedDownloads) {
+  const signedUrl = await file.getSignedUrl({
+    action: 'read',
+    expires: expiresIn,  // 如 900 秒
+  })
+  
+  // 返回 302 重定向
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: signedUrl,
+    },
+  })
+}
+```
+
+#### 模式 C: 直接云端 URL（disablePayloadAccessControl）
+
+当配置了 `disablePayloadAccessControl: true` 时：
+1. beforeChange 时直接调用 `adapter.generateURL` 生成云端 URL
+2. URL 存储到数据库
+3. afterRead 时可能再次生成（如果是动态签名）
+4. 用户直接访问云端 URL，不经过 Payload 代理
+
+### 5.4 三种时机的完整交互示例
+
+让我们通过一个完整的上传和访问流程来理解三种时机的协同工作：
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│  阶段 1: 上传图片                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+
+1. 用户上传图片
+   ↓
+2. generateFileData 处理图片，生成主文件和各尺寸变体
+   - req.file.data = 主文件 Buffer
+   - req.payloadUploadSizes = { thumbnail: Buffer, medium: Buffer, ... }
+   ↓
+3. beforeChange Hook（时机 1: 首写）执行
+   - 为 url 字段生成初始值
+   - 如果是代理模式: url = '/api/media/file/photo.jpg' (无 prefix)
+   - 如果是 disablePayloadAccessControl: url = adapter.generateURL(...)
+   ↓
+4. 数据库首次写入
+   - 存储 filename, prefix, sizes, 以及 beforeChange 生成的 url
+   ↓
+5. afterChange Hook 执行
+   - 从 req.file.data 和 req.payloadUploadSizes 读取 Buffer
+   - 调用 adapter.handleUpload 上传到云端
+   - 如果 adapter 返回元数据，二次写入数据库
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│  阶段 2: 读取文档（查询 API）                                                 │
+└────────────────────────────────────────────────────────────────────────────┘
+
+1. 用户调用 GET /api/media?limit=10
+   ↓
+2. 数据库查询，返回文档数据
+   {
+     filename: 'photo.jpg',
+     prefix: 'uploads/2024/05/',
+     url: '/api/media/file/photo.jpg',  // 数据库中存储的 URL 无 prefix
+     sizes: {
+       thumbnail: {
+         filename: 'photo-400x300.jpg',
+         url: '/api/media/file/photo-400x300.jpg'
+       }
+     }
+   }
+   ↓
+3. afterRead Hook（时机 2: 读取补全）执行
+   - 检测到 prefix 存在
+   - 动态追加 ?prefix=... 参数
+   ↓
+4. 返回给用户的数据
+   {
+     filename: 'photo.jpg',
+     prefix: 'uploads/2024/05/',
+     url: '/api/media/file/photo.jpg?prefix=uploads%2F2024%2F05%2F',  // 补全了 prefix
+     sizes: {
+       thumbnail: {
+         filename: 'photo-400x300.jpg',
+         url: '/api/media/file/photo-400x300.jpg?prefix=uploads%2F2024%2F05%2F'
+       }
+     }
+   }
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│  阶段 3: 实际访问文件                                                        │
+└────────────────────────────────────────────────────────────────────────────┘
+
+1. 用户访问补全后的 URL:
+   GET /api/media/file/photo.jpg?prefix=uploads%2F2024%2F05%2F
+   ↓
+2. Payload 文件路由匹配
+   ↓
+3. staticHandler（时机 3: 代理访问）执行
+   - 从查询参数解析 prefix = 'uploads/2024/05/'
+   - 计算完整 fileKey = 'uploads/2024/05/photo.jpg'
+   - 从云存储获取文件
+   - 代理返回给用户（或重定向到签名 URL）
+```
+
+### 5.5 本地存储 URL 生成
+
+**文件**: `packages/payload/src/uploads/generateFilePathOrURL.ts`
+
+本地存储模式下，URL 生成逻辑相对简单：
+
+```typescript
+export function generateFilePathOrURL({
+  collectionSlug, config, filename, relative, serverURL, urlOrPath,
+}): null | string {
+  
+  // 1. 如果已有外部 URL，直接返回
+  if (urlOrPath) {
+    if (!urlOrPath.startsWith('/') && !urlOrPath.startsWith(serverURL || '')) {
+      return urlOrPath  // 外部 URL
+    }
+  }
+
+  // 2. 构建本地文件 API URL
+  if (filename) {
+    return formatAdminURL({
+      apiRoute: config.routes?.api || '',
+      path: `/${collectionSlug}/file/${encodeURIComponent(filename)}`,
+      relative,
+      serverURL: config.serverURL,
+    })
+  }
+
+  return null
+}
+```
+
+**生成的 URL 格式**:
+- `relative=false`: `{serverURL}/api/{collection}/file/{filename}`
+- `relative=true`: `/api/{collection}/file/{filename}`
+
+### 5.6 URL 策略选择总结
+
+| 策略 | beforeChange (首写) | afterRead (读取) | staticHandler (访问) | 适用场景 |
+|------|---------------------|------------------|---------------------|---------|
+| **代理模式 (默认)** | 生成 `/api/...` URL | 追加 `?prefix=...` | 从云存储读取并代理返回 | 需要访问控制、隐藏真实 URL |
+| **直接云端 URL** | 调用 `adapter.generateURL` 生成并存储 | 可能重新生成（如签名 URL） | 用户直接访问云端，不经过 Payload | 公开文件、CDN 加速 |
+| **签名 URL** | 可能不存储（每次动态生成） | 每次读取时生成新的签名 URL | 返回 302 重定向到签名 URL | 私有文件、带过期时间的访问 |
+| **自定义 URL** | 调用用户的 `generateFileURL` | 同样调用 `generateFileURL` | 取决于自定义实现 | 完全自定义 URL 逻辑 |
 
 ---
 
