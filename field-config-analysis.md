@@ -152,18 +152,32 @@ export type TextFieldClient = {
 
 ## 3. 管理后台 React 组件驱动
 
-### 3.1 服务端专有属性移除清单
+### 3.1 管理后台双数据流架构
 
-**关键发现：** `defaultValue` 属于 `serverOnlyFieldProperties`，在 `createClientField` 时会被移除！
+**重要澄清：** 管理后台有两条独立的数据流，不能混淆：
 
-查看 `packages/payload/src/fields/config/client.ts:53-65`：
+| 数据流 | 触发时机 | 入口函数 | 输出 | 用途 |
+|--------|---------|---------|------|------|
+| **静态配置流** | 启动时/请求时 | `createClientConfig()` | `ClientConfig` | 管理后台基础配置导航等 |
+| **动态表单状态流** | **请求时**（用户访问页面时） | `buildFormState()` **Server Function** | `FormState` | 具体表单的状态和组件 |
 
+**关键修正：**
+- 之前错误地将 `buildFormState()` 归到 `packages/payload/src/admin/forms/Form.ts`
+- 实际上 `Form.ts` **只是类型定义文件**
+- 实际实现在 `packages/ui/src/utilities/buildFormState.ts`
+- `buildFormState` 是一个 **Server Function**，**每次请求时执行**，不是启动时
+
+### 3.2 静态配置转换：服务端专有属性移除
+
+在 `createClientField` 时，以下属性会被移除：
+
+**顶层服务端专有属性：** `packages/payload/src/fields/config/client.ts:53-65`
 ```typescript
 const serverOnlyFieldProperties: Partial<ServerOnlyFieldProperties>[] = [
   'hooks',
   'access',
   'validate',
-  'defaultValue',  // ← 被移除！
+  'defaultValue',
   'filterOptions',
   'editor',
   'custom',
@@ -174,63 +188,289 @@ const serverOnlyFieldProperties: Partial<ServerOnlyFieldProperties>[] = [
 ]
 ```
 
-**admin 中被移除的属性：**
+**admin 中的服务端专有属性：** `packages/payload/src/fields/config/client.ts:68-71`
 ```typescript
 const serverOnlyFieldAdminProperties: Partial<ServerOnlyFieldAdminProperties>[] = [
-  'condition',   // ← 条件显示逻辑在服务端处理
-  'components',  // ← 组件在服务端渲染后传递
+  'condition',   // ← 关键：条件显示逻辑
+  'components',  // ← 关键：自定义组件
 ]
 ```
 
-### 3.2 管理后台数据流
+### 3.3 动态表单状态构建流程
+
+**正确的入口位置：** `packages/ui/src/utilities/buildFormState.ts`
+
+**触发时机：** 用户访问管理后台编辑页面时，客户端调用 Server Function
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           服务端                                               │
-│  ┌──────────────┐    ┌─────────────────────┐    ┌─────────────────────────┐ │
-│  │ Sanitized-   │───▶│ createClientConfig()│───▶│ ClientConfig            │ │
-│  │ Config       │    │ createClientFields()│    │ (无 defaultValue)       │ │
-│  └──────────────┘    └─────────────────────┘    └─────────────────────────┘ │
-│         │                                                         │            │
-│         ▼                                                         ▼            │
-│  ┌──────────────────────────────────────────┐      ┌──────────────────────┐ │
-│  │ buildFormState() - 表单状态构建           │      │ 发送到客户端          │ │
-│  │ packages/payload/src/admin/forms/Form.ts │      │                      │ │
-│  │                                          │      │                      │ │
-│  │ • 调用 getFallbackValue()                │      │                      │ │
-│  │ • 计算 defaultValue → initialValue       │      │                      │ │
-│  │ • 生成 FieldState 包含 initialValue      │      │                      │ │
-│  └──────────────────────────────────────────┘      └──────────────────────┘ │
+│  客户端发起请求                                                                │
+│  调用 buildFormState Server Function                                          │
 └─────────────────────────────────────────────────────────────────────────────┘
                                               │
                                               ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           客户端 (浏览器)                                      │
-│  ┌─────────────────────────────────────────────────────────────────────────┐ │
-│  │ FormState 结构:                                                          │ │
-│  │ {                                                                        │ │
-│  │   'title': {                                                            │ │
-│  │     initialValue: '默认值',  // ← 从服务端接收，不是从配置读取           │ │
-│  │     value: '用户输入',                                                 │ │
-│  │     valid: true,                                                       │ │
-│  │     // 注意：没有 defaultValue 字段！                                   │ │
-│  │   }                                                                     │ │
-│  │ }                                                                        │ │
-│  └─────────────────────────────────────────────────────────────────────────┘ │
+│  服务端执行 buildFormState() (packages/ui/src/utilities/buildFormState.ts)   │
+│                                                                               │
+│  1. 获取 schemaMap (使用 SanitizedConfig)                                    │
+│  2. 获取 clientSchemaMap (使用 ClientConfig)                                 │
+│  3. 调用 fieldSchemasToFormState()                                            │
+│     ├─▶ iterateFields() - 遍历字段                                           │
+│     │       ├─▶ 执行 admin.condition 函数                                     │
+│     │       ├─▶ 计算 passesCondition                                          │
+│     │       └─▶ 准备初始值                                                    │
+│     │                                                                         │
+│     ├─▶ addFieldStatePromise() - 构建单个字段状态                             │
+│     │       ├─▶ 执行 validate 函数                                           │
+│     │       └─▶ 调用 renderFieldFn                                            │
+│     │                                                                         │
+│     └─▶ renderField() - 渲染组件                                             │
+│             ├─▶ 调用 createClientField() 转换字段                             │
+│             ├─▶ 调用 RenderServerComponent() 渲染自定义组件                   │
+│             └─▶ 结果存入 fieldState.customComponents                         │
+│                                                                               │
+│  4. 返回 FormState 给客户端                                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                              │
+                                              ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  客户端接收 FormState                                                          │
+│  - fieldState.initialValue - 默认值                                           │
+│  - fieldState.passesCondition - 是否显示                                       │
+│  - fieldState.customComponents - 已渲染的组件                                  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 默认值承载边界分析
+### 3.4 admin.condition 完整边界流程
+
+**关键澄清：** `condition` 在 `createClientField` 时被移除，但通过另一条路径回到渲染链。
+
+#### 阶段 1：配置转换时被移除
+```typescript
+// packages/payload/src/fields/config/client.ts:68-71
+const serverOnlyFieldAdminProperties: Partial<ServerOnlyFieldAdminProperties>[] = [
+  'condition',   // ← 从 ClientConfig 中移除
+  'components',
+]
+```
+
+**结果：** `ClientConfig` 中的字段配置**没有** `admin.condition`
+
+#### 阶段 2：表单状态构建时执行
+
+**关键洞察：** `buildFormState` 直接使用 `SanitizedConfig`，不是 `ClientConfig`！
+
+查看 `packages/ui/src/utilities/buildFormState.ts:131-152`：
+```typescript
+const schemaMap = getSchemaMap({
+  collectionSlug,
+  config,  // ← 使用 req.payload.config (SanitizedConfig)
+  globalSlug,
+  i18n,
+  widgetSlug,
+})
+
+const clientSchemaMap = getClientSchemaMap({
+  // ...
+  config: getClientConfig({ ... }),  // ← 这里才用 ClientConfig
+  // ...
+})
+```
+
+**condition 执行位置：** `packages/ui/src/forms/fieldSchemasToFormState/iterateFields.ts:149-171`
+```typescript
+if (!skipConditionChecks) {
+  try {
+    passesCondition = Boolean(
+      (field?.admin?.condition
+        ? Boolean(
+            field.admin.condition(fullData || {}, data || {}, {
+              blockData,
+              operation,
+              path: pathSegments,
+              user: req.user,
+            }),
+          )
+        : true) && parentPassesCondition,
+    )
+  } catch (err) {
+    passesCondition = false
+  }
+}
+```
+
+**注意：** 这里的 `field` 来自 `SanitizedConfig`，**包含完整的 `admin.condition` 函数**！
+
+#### 阶段 3：结果存入 FieldState
+
+`packages/ui/src/forms/fieldSchemasToFormState/addFieldStatePromise.ts:177-180`：
+```typescript
+// Append only if true to avoid sending '$undefined' through the network
+if (passesCondition === false) {
+  fieldState.passesCondition = false
+}
+```
+
+#### 阶段 4：传递到客户端并使用
+
+`FieldState` 结构：
+```typescript
+{
+  'title': {
+    initialValue: '...',
+    value: '...',
+    passesCondition: false,  // ← 条件结果，不是原始函数
+    // 注意：没有 admin.condition 函数！
+  }
+}
+```
+
+**客户端使用：** 客户端组件根据 `passesCondition` 决定是否渲染，**不再执行函数**。
+
+#### admin.condition 边界总结
+
+| 阶段 | 位置 | 数据状态 | 说明 |
+|------|------|---------|------|
+| 1 | 用户配置 | `admin.condition: () => boolean` | 函数定义 |
+| 2 | SanitizedConfig | ✅ 保留完整函数 | 单一数据源 |
+| 3 | ClientConfig | ❌ 被移除 | `serverOnlyFieldAdminProperties` |
+| 4 | iterateFields 中 | ✅ 执行函数 | 使用 SanitizedConfig 中的 field |
+| 5 | FieldState | `passesCondition: boolean` | 结果，不是函数 |
+| 6 | 客户端 | ✅ 使用布尔值 | 根据结果判断是否显示 |
+
+### 3.5 admin.components 完整边界流程
+
+**关键澄清：** `components` 在 `createClientField` 时被移除，但通过 **Import Map + 服务端渲染** 回到渲染链。
+
+#### 阶段 1：开发时 - 生成 Import Map
+
+**触发时机：** 开发时 `generateImportMap` 命令
+
+**代码：** `packages/payload/src/bin/generateImportMap/iterateFields.ts`
+```typescript
+// 遍历所有字段配置，收集组件引用
+if (field?.admin?.components) {
+  hasKey(field?.admin?.components, 'Label') && 
+    addToImportMap(field.admin.components.Label)
+  
+  hasKey(field?.admin?.components, 'Field') && 
+    addToImportMap(field.admin.components.Field)
+  
+  // ... 其他组件
+}
+```
+
+**结果：** 组件路径被注册到 `importMap` 中，存储在服务端。
+
+#### 阶段 2：配置转换时被移除
+
+同 `condition`，`components` 在 `serverOnlyFieldAdminProperties` 中，从 `ClientConfig` 移除。
+
+#### 阶段 3：表单状态构建时渲染
+
+**关键洞察：** `renderField` 也直接使用 `SanitizedConfig`！
+
+查看 `packages/ui/src/forms/fieldSchemasToFormState/renderField.tsx:64-72`：
+```typescript
+const clientField =
+  clientFieldSchemaMap && !forceCreateClientField
+    ? (clientFieldSchemaMap.get(schemaPath) as ClientField)
+    : createClientField({
+        // ...
+        field: fieldConfig,  // ← 使用 SanitizedConfig 中的 fieldConfig
+        // ...
+      })
+```
+
+**组件渲染：** `packages/ui/src/forms/fieldSchemasToFormState/renderField.tsx:390-404`
+```typescript
+if ('Field' in fieldConfig.admin.components) {
+  fieldState.customComponents.Field = !mockRSCs ? (
+    <WatchCondition path={path}>
+      {RenderServerComponent({
+        clientProps,
+        Component: fieldConfig.admin.components.Field,  // ← 直接使用 SanitizedConfig 中的组件
+        importMap: req.payload.importMap,  // ← 使用 importMap 解析组件
+        key: 'field.admin.components.Field',
+        serverProps,
+      })}
+    </WatchCondition>
+  ) : (
+    'Mock'
+  )
+}
+```
+
+**RenderServerComponent 机制：**
+1. 使用 `importMap` 解析组件路径
+2. 在服务端渲染组件（RSC 模式）
+3. 渲染结果（React 元素）存入 `fieldState.customComponents`
+
+#### 阶段 4：传递到客户端并使用
+
+`FieldState` 结构：
+```typescript
+{
+  'title': {
+    initialValue: '...',
+    value: '...',
+    customComponents: {
+      Field: <ReactElement>,  // ← 已渲染的组件，不是函数
+      Label: <ReactElement>,
+      // ...
+    }
+  }
+}
+```
+
+**客户端使用：** 客户端直接使用 `customComponents` 中的 React 元素，**不再执行组件函数**。
+
+#### admin.components 边界总结
+
+| 阶段 | 位置 | 数据状态 | 说明 |
+|------|------|---------|------|
+| 1 | 用户配置 | `admin.components: { Field: MyComponent }` | 组件引用 |
+| 2 | SanitizedConfig | ✅ 保留完整引用 | 单一数据源 |
+| 3 | Import Map | ✅ 注册路径 | 开发时收集 |
+| 4 | ClientConfig | ❌ 被移除 | `serverOnlyFieldAdminProperties` |
+| 5 | renderField 中 | ✅ 服务端渲染 | 使用 SanitizedConfig + importMap |
+| 6 | FieldState | `customComponents: ReactElement` | 已渲染的元素 |
+| 7 | 客户端 | ✅ 使用元素 | 直接使用，不再解析 |
+
+### 3.6 defaultValue 承载边界分析
 
 | 位置 | defaultValue 状态 | 说明 |
 |------|------------------|------|
 | **用户配置** | ✅ 存在 | 用户定义的 `defaultValue: '...'` |
 | **SanitizedConfig** | ✅ 存在 | 清理后仍保留 |
 | **ClientConfig** | ❌ 被移除 | `serverOnlyFieldProperties` 列表中 |
+| **buildFormState 中** | ✅ 使用计算 | 从 data 中取值，无显式 defaultValue 调用 |
+| **FieldState.initialValue** | ✅ 存在 | 从 data 映射而来 |
 | **客户端 FormState** | ❌ 不存在 | 客户端从未直接访问 `defaultValue` |
-| **FormState.initialValue** | ✅ 存在 | **服务端计算后传递** |
 
 **关键代码验证：**
+
+`packages/ui/src/utilities/buildFormState.ts:175`：
+```typescript
+// If there is form state but no data, deduce data from that form state, e.g. on initial load
+// Otherwise, use the incoming data as the source of truth, e.g. on subsequent saves
+const data = incomingData || reduceFieldsToValues(formState, true)
+```
+
+`packages/ui/src/forms/fieldSchemasToFormState/addFieldStatePromise.ts:791-798`：
+```typescript
+default: {
+  if (data[field.name] !== undefined) {
+    fieldState.value = data[field.name]
+    fieldState.initialValue = data[field.name]
+  }
+  // ...
+}
+```
+
+**重要发现：** 管理后台的 `initialValue` 不是从 `field.defaultValue` 计算的，而是从 `data` 中映射的。`data` 来自 `incomingData`（已有文档数据）或从 `formState` 还原。
+
+**REST API 中的 defaultValue 处理：**
 
 `packages/payload/src/fields/hooks/beforeValidate/getFallbackValue.ts:20-27`：
 ```typescript
@@ -253,11 +493,12 @@ if (defaultValue && typeof defaultValue === 'function') {
 
 **结论：**
 - `defaultValue` 完全是**服务端概念**
-- 管理后台的默认值通过 `initialValue` 传递，这是在**服务端计算**的
+- **管理后台**：`initialValue` 从 `data` 映射，不是直接从 `field.defaultValue` 计算
+- **REST API**：`beforeValidate` 钩子中通过 `getFallbackValue` 处理 `defaultValue`
 - 客户端组件不直接访问 `defaultValue`，只使用 `initialValue`
 - 函数类型的 `defaultValue` 只能在服务端执行（需要 `req`、`user` 等上下文）
 
-### 3.4 管理后台组件映射
+### 3.7 管理后台组件映射
 
 管理后台根据字段的 `type` 属性渲染对应的 React 组件：
 
@@ -286,6 +527,22 @@ if (defaultValue && typeof defaultValue === 'function') {
 | `join` | `admin/fields/Join.ts` | 关联查询字段 |
 | `point` | `admin/fields/Point.ts` | 地理坐标字段 |
 | `hidden` | `admin/fields/Hidden.ts` | 隐藏字段 |
+
+### 3.8 服务端专有属性回归路径总结
+
+| 属性 | 从哪移除 | 回归路径 | 最终形式 |
+|------|---------|---------|---------|
+| `defaultValue` | `serverOnlyFieldProperties` | 管理后台：data → initialValue；REST：getFallbackValue | `initialValue` (值) |
+| `admin.condition` | `serverOnlyFieldAdminProperties` | SanitizedConfig → iterateFields 执行 → passesCondition | `passesCondition` (布尔值) |
+| `admin.components` | `serverOnlyFieldAdminProperties` | Import Map → renderField 渲染 → customComponents | `customComponents` (React 元素) |
+| `validate` | `serverOnlyFieldProperties` | SanitizedConfig → addFieldStatePromise 执行 | 不传递，结果存入 `valid`, `errorMessage` |
+| `hooks` | `serverOnlyFieldProperties` | 仅服务端使用，不传递到客户端 | 不传递 |
+| `access` | `serverOnlyFieldProperties` | 服务端权限检查，不传递到客户端 | 不传递 |
+
+**核心设计模式：**
+1. **函数类型属性**：在服务端执行，结果传递到客户端
+2. **组件类型属性**：在服务端渲染（RSC），渲染结果传递到客户端
+3. **所有服务端专有属性**：都不直接传递到客户端，只传递执行/渲染结果
 
 ---
 
