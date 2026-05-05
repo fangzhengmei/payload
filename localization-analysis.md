@@ -752,60 +752,61 @@ export const sanitizeFallbackLocale = ({
 }
 ```
 
-### 5.2 三层 Fallback 规则
+### 5.2 三层 Fallback 规则：互斥而非串联
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                        Fallback 优先级（从高到低）                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│  第一层：请求级别 fallbackLocale (最高优先级)                                 │
+│  第一层：请求自定义 fallbackLocale (最高优先级)                               │
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ 触发条件: fallbackLocale !== undefined && fallbackLocale !== null     │  │
 │  │ 来源: URL 参数 (?fallbackLocale=es) 或 Local API 选项                 │  │
-│  │                                                                         │  │
 │  │ 格式支持:                                                               │  │
-│  │   - 字符串: ?fallbackLocale=es                                         │  │
-│  │   - 数组: ?fallbackLocale=es&fallbackLocale=en (按顺序)               │  │
+│  │   - 字符串: ?fallbackLocale=es  (单个 fallback)                        │  │
+│  │   - 数组: ?fallbackLocale=es&fallbackLocale=en (按顺序尝试)            │  │
 │  │   - 特殊值: ?fallbackLocale=false (禁用)                                │  │
-│  │                                                                         │  │
-│  │ 行为: 完全覆盖配置中的任何 fallback 规则                                │  │
+│  │ 行为: 完全使用请求参数，忽略配置中的任何 fallback 规则                   │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
-│                                      │                                       │
-│                                      ▼                                       │
+│                                                                              │
+│  ───────────────────────────────────────────────────────────────────────    │
+│                                                                              │
 │  第二层：Locale 专属 fallbackLocale                                          │
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │ 来源: 配置中 locales 数组的 fallbackLocale 字段                        │  │
+│  │ 触发条件:                                                                │  │
+│  │   1. fallbackLocale === undefined || fallbackLocale === null          │  │
+│  │   2. localization.fallback === true                                    │  │
+│  │   3. 当前语言有 fallbackLocale 配置                                     │  │
+│  │ 来源: 配置中 locales[i].fallbackLocale                                  │  │
+│  │ 格式支持: 字符串或数组                                                    │  │
+│  │ 行为: 返回当前语言配置的 fallbackLocale                                 │  │
 │  │                                                                         │  │
-│  │ 示例配置:                                                               │  │
-│  │   locales: [                                                           │  │
-│  │     { code: 'en', label: 'English' },                                 │  │
-│  │     { code: 'es', label: 'Spanish' },                                 │  │
-│  │     { code: 'pt', label: 'Portuguese', fallbackLocale: 'es' },       │  │
-│  │     { code: 'fr', label: 'French', fallbackLocale: ['es', 'en'] },   │  │
-│  │   ]                                                                    │  │
-│  │                                                                         │  │
-│  │ 触发条件:                                                               │  │
-│  │   1. localization.fallback === true                                    │  │
-│  │   2. 请求未提供 fallbackLocale 参数                                     │  │
-│  │                                                                         │  │
-│  │ 行为: 如果当前语言有 fallbackLocale 配置，使用该配置                    │  │
+│  │ 注意: 一旦满足此条件，就不会再触发默认 fallback！                        │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
-│                                      │                                       │
-│                                      ▼                                       │
-│  第三层：默认语言 defaultLocale                                               │
+│                                                                              │
+│  ───────────────────────────────────────────────────────────────────────    │
+│                                                                              │
+│  第三层：默认 fallback (defaultLocale)                                       │
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │ 来源: localization.defaultLocale                                       │  │
-│  │                                                                         │  │
-│  │ 触发条件:                                                               │  │
-│  │   1. localization.fallback === true                                    │  │
-│  │   2. 请求未提供 fallbackLocale 参数                                     │  │
+│  │ 触发条件:                                                                │  │
+│  │   1. fallbackLocale === undefined || fallbackLocale === null          │  │
+│  │   2. localization.fallback === true                                    │  │
 │  │   3. 当前语言没有配置 fallbackLocale                                    │  │
-│  │                                                                         │  │
+│  │ 来源: localization.defaultLocale                                       │  │
+│  │ 格式支持: 字符串（单个 defaultLocale）                                   │  │
 │  │ 行为: fallback 到默认语言                                               │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**核心原则**：
+> **Locale 专属 fallback 和 默认 fallback 是互斥的，不会自动串联。**
+> 
+> - 如果当前语言有 `fallbackLocale` 配置，就用这个配置（第二层）
+> - 只有当当前语言**没有** `fallbackLocale` 配置时，才用 `defaultLocale`（第三层）
+> - 数组形式的 `fallbackLocale` 本身就定义了完整的 fallback 链
 
 ### 5.3 配置示例与行为
 
