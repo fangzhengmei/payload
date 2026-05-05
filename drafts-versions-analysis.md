@@ -333,8 +333,8 @@ const result = await getFormState({
 │  1. 锁的创建 (Create)                                                │
 │     ┌─────────────────────────────────────────────────────────┐    │
 │     │ 用户A打开文档编辑页 → 首次字段变更触发 onChange         │    │
-│     │ → 调用 getFormState(updateLastEdited=true)             │    │
-│     │ → 服务端创建/更新 payload-locked-documents 记录        │    │
+│     │ → 调用 getFormState(returnLockStatus=true)             │    │
+│     │ → 若当前没有活动锁，服务端创建锁记录                    │    │
 │     │ → 返回 lockedState 给前端                                │    │
 │     └─────────────────────────────────────────────────────────┘    │
 │                              ↓                                        │
@@ -473,140 +473,431 @@ const lockDurationInMilliseconds = lockDuration * 1000
 
 ---
 
-### 3.2 哪些操作会绕过锁校验
+### 3.2 集合文档 vs 全局配置：两条写入链路的锁行为差异
 
-#### 3.2.1 关键发现：overrideLock 默认值
+#### 3.2.1 关键发现：两条链路的默认行为完全不同
 
-**Local API 的默认行为** (`collections/operations/local/update.ts:86-90`)：
+**深入代码追踪后，发现了一个重要的差异：
+
+| 链路类型 | API 入口文件 | overrideLock 处理方式 | 默认行为 |
+|---------|-----------|----------------------|---------|
+| **集合文档 (Collection)** | `collections/endpoints/updateByID.ts:33` | `overrideLock ?? false` | **默认拦住（执行锁检查）** |
+| **全局配置 (Global)** | `globals/endpoints/update.ts` | **没有传递 overrideLock 参数** | **默认放行（绕过锁检查）** |
+
+这是一个潜在的不一致性设计！
+
+---
+
+#### 3.2.2 集合文档写入链路详解
+
+**REST API 入口** (`collections/endpoints/updateByID.ts`)：
 
 ```typescript
-/**
- * By default, document locks are ignored (`true`). 
- * Set to `false` to enforce locks and prevent operations 
- * when a document is locked by another user.
- * 
- * @default true  // ⚠️ 默认绕过锁检查！
- */
-overrideLock?: boolean
-```
+const { overrideLock, ... } = parseParams(req.query)
 
-**这是一个极其重要的设计决策**：
-- **默认情况下，Local API 调用会绕过所有锁检查**
-- 只有显式设置 `overrideLock: false` 才会强制执行锁校验
-
-#### 3.2.2 各层 API 的 overrideLock 行为
-
-| API 层 | overrideLock 默认值 | 行为说明 |
-|--------|---------------------|---------|
-| **Local API** | `true` | 默认绕过锁检查；需显式设为 `false` 才检查 |
-| **REST API** | 从 query 参数解析 | `/api/posts/123?overrideLock=false` |
-| **GraphQL API** | 从变量解析 | mutation { updatePost(overrideLock: false, ...) } |
-| **Admin UI 保存/更新** | 未显式传递 → undefined | 需要追踪实际调用链 |
-
-#### 3.2.3 会执行锁检查的操作
-
-**服务端哪些操作调用了 `checkDocumentLockStatus`？**
-
-通过搜索源码，以下操作会调用锁检查：
-
-| 操作 | 文件位置 | 锁检查目的 |
-|------|---------|-----------|
-| **update (Collection)** | `collections/operations/utilities/update.ts:133` | 更新文档前检查 |
-| **update (Global)** | `globals/operations/update.ts:185` | 更新 Global 前检查 |
-| **deleteByID** | `collections/operations/deleteByID.ts:135` | 删除文档前检查 |
-| **delete** | `collections/operations/delete.ts:155` | 批量删除前检查 (每条记录) |
-
-**调用示例** (`update.ts:133-139`)：
-```typescript
-await checkDocumentLockStatus({
-  id,
-  collectionSlug: collectionConfig.slug,
-  lockErrorMessage: `Document with ID ${id} is currently locked by another user and cannot be updated.`,
-  overrideLock,  // 传入的参数
-  req,
+const doc = await updateByIDOperation({
+  // ...
+  overrideLock: overrideLock ?? false,  // ⚠️ 关键：默认是 false！
+  // ...
 })
 ```
 
-#### 3.2.4 实际场景分析
-
-**场景1：Admin UI 中用户 A 编辑，用户 B 尝试保存**
+**完整链路追踪**：
 
 ```
-Admin UI 保存请求流程：
-1. 前端 Form 提交 PATCH 请求
-2. REST API endpoint 接收
-3. parseParams 解析 query 参数
-   - overrideLock 从 URL query 读取
-   - 如果 URL 中没有 ?overrideLock=xxx，则为 undefined
-4. 调用 local update 操作
-   - Local API 中 overrideLock 也是 undefined
-5. 调用 checkDocumentLockStatus
-   - overrideLock 默认 true (checkDocumentLockStatus.ts:24)
-   - 所以会绕过锁检查？？？
+集合文档 REST API 更新请求链路：
+
+1. 前端 PATCH 请求：/api/posts/123
+   └─ URL Query 中没有 overrideLock 参数
+
+2. REST Handler (updateByID.ts)
+   └─ overrideLock = parseParams(req.query).overrideLock  → undefined
+   └─ 传递给 updateByIDOperation：overrideLock ?? false  → false
+
+3. updateByIDOperation → updateDocument
+   └─ 传递 overrideLock: false
+
+4. checkDocumentLockStatus (overrideLock = false)
+   └─ 执行严格锁检查！
+   └─ 如果被其他用户锁定且未过期 → 抛出 Locked 错误
 ```
 
-**等等，这和预期不符。让我重新追踪 Admin UI 的实际调用...**
+**结论：集合文档的 REST API 默认执行锁检查！**
 
-从前端 `Edit/index.tsx` 的 `onSave` 回调来看：
-- 它调用的是 Form 的 `action` (REST API)
-- 但 Form 的提交可能没有显式传递 `overrideLock`
+---
 
-**但从测试用例 `e2e.spec.ts` 来看**，锁确实在 Admin UI 中生效了。让我查看测试中的描述：
+#### 3.2.3 全局配置写入链路详解
+
+**REST API 入口** (`globals/endpoints/update.ts`)：
 
 ```typescript
-// e2e.spec.ts 中的测试描述了：
-// - 用户A编辑文档时会创建锁
-// - 用户B尝试编辑时会看到 "Document Locked" 模态框
-// - 用户B只能选择：Go Back / View Read-Only / Take Over
+// ⚠️ 注意：根本没有读取或传递 overrideLock 参数！
+const result = await updateOperation({
+  slug: globalConfig.slug,
+  autosave,
+  data: req.data!,
+  // ... 其他参数
+  // 没有 overrideLock！
+})
 ```
 
-**实际机制**：
+**完整链路追踪**：
 
-Admin UI 的锁保护是**双层的**：
+```
+全局配置 REST API 更新请求链路：
+
+1. 前端 POST 请求：/api/globals/menu
+   └─ URL Query 中没有 overrideLock 参数
+
+2. REST Handler (globals/endpoints/update.ts)
+   └─ 没有读取 overrideLock
+   └─ 调用 updateOperation 时没有传递 overrideLock
+
+3. updateOperation (globals/operations/update.ts)
+   └─ 解构参数：overrideLock,  // undefined
+   └─ 调用 checkDocumentLockStatus({ overrideLock, ... })
+
+4. checkDocumentLockStatus (overrideLock = undefined)
+   └─ 函数默认值：overrideLock = true  // checkDocumentLockStatus.ts:24
+   └─ 跳过锁检查！直接放行
+```
+
+**结论：全局配置的 REST API 默认绕过锁检查！**
+
+---
+
+#### 3.2.4 Local API 的行为
+
+**Local API 中没有设置默认值**，直接传递：
+
+```typescript
+// collections/operations/local/update.ts
+const args = {
+  // ...
+  overrideLock,  // 直接传递用户传入的值，没有 ?? false
+  // ...
+}
+```
+
+所以 Local API 的行为取决于 `checkDocumentLockStatus` 的函数默认值：
+
+```typescript
+// checkDocumentLockStatus.ts:24
+overrideLock = true,  // 函数参数默认值
+```
+
+**Local API 行为总结**：
+
+| 调用方式 | overrideLock 值 | 行为 |
+|---------|----------------|------|
+| 不显式传递 | `undefined` → 使用函数默认 `true` | 绕过锁检查 |
+| 显式传递 `overrideLock: false` | `false` | 执行锁检查 |
+| 显式传递 `overrideLock: true` | `true` | 绕过锁检查 |
+
+---
+
+#### 3.2.5 各操作的锁检查行为汇总
+
+**服务端调用 `checkDocumentLockStatus` 的操作：
+
+| 操作 | 集合/全局 | REST API 默认行为 | Local API 默认行为 |
+|------|-----------|------------------|-------------------|
+| **updateByID** | 集合 | **拦住** (执行锁检查) | 放行 (绕过检查) |
+| **update** | 全局 | **放行** (绕过检查) | 放行 (绕过检查) |
+| **deleteByID** | 集合 | 需查看 endpoint | 需查看 endpoint |
+| **delete** | 集合 | 需查看 endpoint | 需查看 endpoint |
+
+**Admin UI 的实际保护机制：
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Admin UI 锁保护机制                            │
+│                    Admin UI 锁保护的真实机制                      │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  第一层：前端保护 (强保护)                                        │
+│  集合文档：双层保护                                              │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │ 1. 用户打开编辑页时，通过 getFormState 获取 lockedState   │  │
-│  │ 2. 如果被其他用户锁定：                                    │  │
-│  │    - 显示 "Document Locked" 模态框                        │  │
-│  │    - 用户选择 "View Read-Only" 时：                       │  │
-│  │      → setIsReadOnlyForIncomingUser(true)                 │  │
-│  │      → Form 被禁用 (disabled=true)                        │  │
-│  │      → 所有输入字段 disabled                                │  │
-│  │      → 保存按钮 disabled                                   │  │
-│  │ 3. 用户根本无法提交请求！                                   │  │
+│  │ 第一层：前端保护（强）                                    │  │
+│  │   - 用户B打开编辑页时，getFormState 返回 lockedState      │  │
+│  │   - 显示 "Document Locked" 模态框                        │  │
+│  │   - 选择 "View Read-Only" → Form disabled               │  │
+│  │   - 用户根本无法提交请求！                                 │  │
+│  ├─────────────────────────────────────────────────────────┤  │
+│  │ 第二层：服务端保护（强）                                  │  │
+│  │   - 集合 REST API 默认 overrideLock: false               │  │
+│  │   - 即使前端被绕过（如直接调用 API），服务端也会拦住       │  │
 │  └─────────────────────────────────────────────────────────┘  │
 │                                                                 │
-│  第二层：服务端保护 (弱保护，需显式配置)                         │
+│  全局配置：只有前端保护                                          │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │ 需要显式传递 overrideLock: false 才会检查                 │  │
-│  │ Admin UI 的 REST 调用可能没有传递这个参数                  │  │
-│  │ 所以主要依靠前端第一层保护                                  │  │
+│  │ 第一层：前端保护（强）                                    │  │
+│  │   - 同集合文档，Form disabled                           │  │
+│  ├─────────────────────────────────────────────────────────┤  │
+│  │ 第二层：服务端保护（无！）                                │  │
+│  │   - 全局 REST API 没有传递 overrideLock                   │  │
+│  │   - 默认绕过锁检查！                                      │  │
+│  │   - ⚠️ 如果直接调用 API，可以绕过前端保护直接写入！            │  │
 │  └─────────────────────────────────────────────────────────┘  │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**关键代码** (`Edit/index.tsx:623-628`)：
+---
+
+#### 3.2.6 关键代码对照
+
+**集合 REST API（拦住）**：
 ```typescript
-<Form
-  // ...
-  disabled={
-    isReadOnlyForIncomingUser ||  // 被其他用户锁定时设为 true
-    isInitializing || 
-    !hasSavePermission || 
-    isTrashed
-  }
-  // ...
->
+// collections/endpoints/updateByID.ts:33
+overrideLock: overrideLock ?? false,  // ⚠️ 默认 false，执行锁检查
 ```
 
-#### 3.2.5 Take Over (抢占编辑权) 机制
+**全局 REST API（放行）**：
+```typescript
+// globals/endpoints/update.ts
+// 没有 overrideLock 参数！直接调用 updateOperation 时没有传递
+```
+
+**checkDocumentLockStatus 默认值**：
+```typescript
+// checkDocumentLockStatus.ts:24
+overrideLock = true,  // ⚠️ 函数参数默认 true，绕过锁检查
+```
+
+---
+
+#### 3.2.7 锁检查后清理哪些锁记录？
+
+这是一个非常关键但容易被忽视的细节。让我们深入分析 `checkDocumentLockStatus` 的执行流程。
+
+**完整的函数结构** (`checkDocumentLockStatus.ts`)：
+
+```typescript
+// 第 18-26 行：函数参数
+export const checkDocumentLockStatus = async ({
+  id,
+  collectionSlug,
+  globalSlug,
+  lockDurationDefault = 300,
+  lockErrorMessage,
+  overrideLock = true,  // ⚠️ 默认绕过锁检查
+  req,
+}: CheckDocumentLockStatusArgs): Promise<void> => {
+```
+
+**执行顺序分析**：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│            checkDocumentLockStatus 完整执行流程                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  阶段 1：前置检查                                                    │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │ 30-33 行：检查 locked-documents 集合是否存在                  │  │
+│  │ 36-40 行：获取 lockDocuments 配置，判断是否启用锁定            │  │
+│  │ 42-55 行：构建 lockedDocumentQuery                            │  │
+│  │ 57-59 行：如果 !isLockingEnabled → 直接返回（不删除任何锁）   │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                              ↓                                        │
+│  阶段 2：锁检查（仅当 overrideLock = false 时执行）                  │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │ 62-97 行：if (!overrideLock) { ... }                         │  │
+│  │                                                              │  │
+│  │ 69-75 行：查询锁记录                                          │  │
+│  │ 80-95 行：检查锁定条件                                        │  │
+│  │                                                              │  │
+│  │ 关键判断（90-95 行）：                                        │  │
+│  │ if (                                                         │  │
+│  │   lockedDoc.user?.value !== currentUserId &&  // 不是当前用户 │  │
+│  │   now - lastEditedAt <= lockDurationInMilliseconds  // 锁未过期│  │
+│  │ ) {                                                          │  │
+│  │   throw new Locked(finalLockErrorMessage)  // ⚠️ 抛出错误！   │  │
+│  │ }                                                            │  │
+│  │                                                              │  │
+│  │ ⚠️ 如果抛出 Locked 错误：                                      │  │
+│  │    → 函数在此处终止                                           │  │
+│  │    → 不会执行后面的删除操作                                    │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                              ↓                                        │
+│  阶段 3：删除锁记录（无论 overrideLock 是什么，只要没抛出错误就执行） │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │ 99-105 行：                                                  │  │
+│  │ await payload.db.deleteMany({                                │  │
+│  │   collection: lockedDocumentsCollectionSlug,                │  │
+│  │   req: payload.db.name === 'mongoose' ? undefined : req,   │  │
+│  │   where: lockedDocumentQuery,  // ⚠️ 关键：只删除当前文档的锁 │  │
+│  │ })                                                           │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**lockedDocumentQuery 的定义**（第 42-55 行）：
+
+```typescript
+let lockedDocumentQuery = {}
+
+if (collectionSlug) {
+  // 集合文档：精确匹配
+  lockedDocumentQuery = {
+    and: [
+      { 'document.relationTo': { equals: collectionSlug } },
+      { 'document.value': { equals: id } },
+    ],
+  }
+} else if (globalSlug) {
+  // 全局配置：精确匹配
+  lockedDocumentQuery = { globalSlug: { equals: globalSlug } }
+}
+```
+
+---
+
+#### 3.2.8 清理行为汇总
+
+| 场景 | 阶段 1 锁定启用 | 阶段 2 锁检查 | 阶段 3 删除锁记录 | 删除哪些记录 |
+|------|----------------|--------------|------------------|-------------|
+| **正常写入（当前用户是锁定者）** | 是 | 通过 | ✅ 执行 | 当前文档的锁 |
+| **正常写入（无锁记录）** | 是 | 通过 | ✅ 执行 | 当前文档的锁（无记录，空删除） |
+| **overrideLock=true（绕过检查）** | 是 | 跳过 | ✅ 执行 | 当前文档的锁 |
+| **被其他用户锁定且锁未过期** | 是 | ❌ 抛出 Locked 错误 | ❌ 不执行 | 无（函数提前终止） |
+| **被其他用户锁定但锁已过期** | 是 | 通过（过期视为无锁） | ✅ 执行 | 当前文档的锁（此时应该是空的？） |
+| **集合 lockDocuments: false** | 否 | 跳过 | ❌ 不执行 | 无（函数提前返回） |
+
+---
+
+#### 3.2.9 关键发现总结
+
+**发现 1：成功写入时会自动解锁**
+
+每次成功的写入操作（更新、删除）都会调用 `checkDocumentLockStatus`，而该函数在通过检查后会**删除当前文档的锁记录**。
+
+这意味着：
+- 用户 A 编辑文档 → 创建锁
+- 用户 A 保存文档 → 锁被删除
+- 用户 B 此时可以正常编辑
+
+**发现 2：锁检查失败时不会删除锁**
+
+如果用户 B 尝试写入被用户 A 锁定的文档：
+1. `overrideLock = false`（集合 REST API 默认）
+2. 检查发现：`lockedDoc.user?.value !== currentUserId` 且锁未过期
+3. **抛出 `Locked` 错误**
+4. 函数在此处终止，**不会执行删除操作**
+5. 用户 A 的锁保持不变
+
+**发现 3：只删除当前操作文档的锁**
+
+`lockedDocumentQuery` 是精确匹配：
+- 集合文档：`document.relationTo = collectionSlug` AND `document.value = id`
+- 全局配置：`globalSlug = globalSlug`
+
+**不会删除其他文档的锁记录**。
+
+**发现 4：overrideLock=true 仍然会删除锁**
+
+即使设置 `overrideLock: true` 绕过了锁检查，只要锁定功能启用且没有抛出错误，仍然会执行删除当前文档锁记录的操作。
+
+这意味着：
+- 如果你通过 API 调用 `overrideLock: true` 强行写入
+- 写入成功后，原来的锁会被删除
+- 相当于你强行接管了编辑权并解锁
+
+---
+
+#### 3.2.10 实际场景示例
+
+**场景 1：正常编辑流程**
+
+```
+时间线：
+T1: 用户A打开 posts/123 编辑页
+    → 首次字段变更触发 getFormState(returnLockStatus=true)
+    → 若当前没有活动锁，则创建锁记录：{ document: { relationTo: 'posts', value: 123 }, user: A }
+
+T2: 用户A持续编辑（每10秒续期一次）
+    → 锁记录的 updatedAt 不断更新
+
+T3: 用户A点击保存
+    → REST PATCH /api/posts/123
+    → 集合 REST API → overrideLock ?? false → false
+    → checkDocumentLockStatus(overrideLock=false)
+      ├─ 查询锁记录 → 找到，锁定者是用户A
+      ├─ 检查：lockedDoc.user?.value === currentUserId → 通过
+      └─ 删除当前文档的锁记录 ✅
+    → 保存成功
+    → 锁已被清除
+
+T4: 用户B打开 posts/123 编辑页
+    → 没有锁记录
+    → 可以正常编辑
+```
+
+**场景 2：多人冲突（集合文档，服务端拦住）**
+
+```
+时间线：
+T1: 用户A打开 posts/123 编辑页
+    → 创建锁记录（user: A）
+
+T2: 用户B尝试打开 posts/123 编辑页
+    → getFormState 返回 lockedState={ user: A }
+    → 前端显示 "Document Locked" 模态框
+    → 用户B选择 "View Read-Only"
+    → Form disabled，无法提交
+
+T3: 用户B绕过前端，直接调用 REST API
+    → PATCH /api/posts/123
+    → 集合 REST API → overrideLock = false
+    → checkDocumentLockStatus(overrideLock=false)
+      ├─ 查询锁记录 → 找到，锁定者是用户A
+      ├─ 检查：A.id !== B.id 且锁未过期
+      └─ 抛出 Locked 错误 ❌
+      └─ ⚠️ 函数在此终止，不会删除锁记录
+    → API 返回 423 Locked
+    → 用户A的锁保持不变
+```
+
+**场景 3：多人冲突（全局配置，服务端放行）**
+
+```
+时间线：
+T1: 用户A打开全局配置 "menu" 编辑页
+    → 创建锁记录（user: A）
+
+T2: 用户B绕过前端，直接调用 REST API
+    → POST /api/globals/menu
+    → 全局 REST API → 没有传递 overrideLock
+    → updateOperation 中 overrideLock = undefined
+    → checkDocumentLockStatus(overrideLock=undefined)
+      ├─ 函数默认值：overrideLock = true
+      ├─ 跳过锁检查（第 62-97 行不执行）
+      └─ 删除当前文档的锁记录 ✅
+    → 保存成功！⚠️
+    → 用户A的锁被删除了
+```
+
+**场景 4：使用 overrideLock=true 强行接管**
+
+```
+时间线：
+T1: 用户A打开 posts/123 编辑页
+    → 创建锁记录（user: A）
+
+T2: 用户B调用 API 并设置 overrideLock=true
+    → PATCH /api/posts/123?overrideLock=true
+    → 集合 REST API → overrideLock = true
+    → checkDocumentLockStatus(overrideLock=true)
+      ├─ 跳过锁检查
+      └─ 删除当前文档的锁记录 ✅
+    → 保存成功
+    → 用户A的锁被删除
+    → 用户A后续编辑时会检测到锁变化，显示 "Take Over" 模态框
+```
+
+---
+
+#### 3.2.11 Take Over (抢占编辑权) 机制
 
 当用户 B 看到 "Document Locked" 模态框时，有三个选项：
 
