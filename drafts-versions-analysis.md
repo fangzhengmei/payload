@@ -197,65 +197,495 @@ const isSavingDraft =
 
 ## 3. 多人编辑冲突处理机制
 
-### 3.1 文档锁定 (Document Locking)
+### 3.1 文档锁定 (Document Locking) 完整生命周期
 
-#### 3.1.1 核心配置
+#### 3.1.1 锁定功能何时生效
 
-**锁定集合** (`packages/payload/src/locked-documents/config.ts`)：
+**启用条件**：
+
+锁定功能的启用遵循以下优先级：
+
+```
+1. 必须有至少一个 auth 集合
+   └─ 没有认证用户 → 无法追踪锁定者 → 不创建 locked-documents 集合
+
+2. 集合/Global 级别配置
+   ├─ lockDocuments: false → 明确禁用
+   ├─ lockDocuments: true 或 { duration: X } → 明确启用
+   └─ 未定义 (undefined) → 默认启用
+   
+3. 最终判定：lockDocuments !== false 才启用
+```
+
+**自动禁用锁定的系统集合** (`locked-documents/config.ts:10-14`)：
 
 ```typescript
-// 自动创建的锁定文档集合
+// 这些集合自动设置 lockDocuments: false，防止递归锁定
+collections.filter((collectionConfig) => collectionConfig.lockDocuments !== false)
+
+// 系统内部禁用锁定的集合：
+// - queues
+// - query-presets  
+// - preferences
+// - locked-documents 本身 (防止递归)
+// - kv-adapter (DatabaseKVAdapter)
+// - migrations
+```
+
+**锁定集合创建条件** (`config.ts:26-30`)：
+```typescript
+// 如果没有 auth 集合，无法追踪是谁锁定了文档
+// 所以不创建 locked-documents 集合
+if (authCollections.length === 0) {
+  return null
+}
+```
+
+#### 3.1.2 锁定集合结构
+
+**自动创建的锁定集合** (`packages/payload/src/locked-documents/config.ts`)：
+
+```typescript
 {
   slug: 'payload-locked-documents',
+  lockDocuments: false,  // 自身不锁定，防止递归
   fields: [
-    { name: 'document', type: 'relationship', relationTo: 可锁定集合 },
-    { name: 'globalSlug', type: 'text' },  // 用于 Global 锁定
-    { name: 'user', type: 'relationship', relationTo: 认证集合, required: true }
+    { 
+      name: 'document', 
+      type: 'relationship', 
+      relationTo: 所有可锁定集合,
+      admin: { readOnly: true }
+    },
+    { 
+      name: 'globalSlug', 
+      type: 'text',
+      admin: { readOnly: true, condition: ({ document }) => !document }
+    },
+    { 
+      name: 'user', 
+      type: 'relationship', 
+      relationTo: 认证集合, 
+      required: true,
+      admin: { readOnly: true }
+    }
   ]
 }
 ```
 
-#### 3.1.2 锁定检查流程
-
-**服务端实际分成两段：**
-- **建锁 / 续锁**：编辑页读表单状态时通过 `handleFormStateLocking` 创建或续期锁记录
-- **写入前校验**：真正更新文档时通过 `checkDocumentLockStatus` 拦截其他用户的写入
-
-**写入前校验函数** (`packages/payload/src/utilities/checkDocumentLockStatus.ts`)
-
-```
-写入前锁检查流程：
-1. 检查锁定功能是否启用 (lockDocuments !== false)
-2. 查询 'payload-locked-documents' 集合
-3. 检查是否存在锁定记录：
-   a. 锁定者是当前用户 → 允许写入
-   b. 锁定者是其他用户且锁未过期 → 抛出 Locked 错误
-   c. 锁已过期 → 允许写入，并清除旧锁
-4. 当前函数只负责校验和清理，不在这里新建锁记录
-```
-
-#### 3.1.3 锁参数配置
-
-```typescript
-// 锁定持续时间（秒）
-lockDurationDefault = 300  // 默认 5 分钟
-
-// 自定义配置
-lockDocuments: {
-  duration: 600  // 10 分钟
+**锁定记录数据结构**：
+```json
+{
+  "_id": "锁记录ID",
+  "document": {
+    "relationTo": "posts",
+    "value": "文档ID"
+  },
+  "globalSlug": null,  // 仅用于 Global
+  "user": {
+    "relationTo": "users",
+    "value": "用户ID"
+  },
+  "createdAt": "2024-01-01T00:00:00.000Z",
+  "updatedAt": "2024-01-01T00:05:00.000Z"  // 关键：用于判断锁是否过期
 }
 ```
 
-### 3.2 并发写入冲突处理
+#### 3.1.3 锁记录的创建与续期机制
 
-#### 3.2.1 乐观锁策略
+**锁在哪里创建？**
 
-在 `updateLatestVersion.ts` 中实现了并发冲突检测：
+锁记录的创建和续期**不在写入操作时**，而是在**Admin UI 编辑页面的表单状态请求时**。
+
+**核心代码位置**：
+- 前端：`packages/ui/src/views/Edit/index.tsx:468-566` (onChange 回调)
+- 服务端：表单状态处理时的 `handleFormStateLocking`
+
+**前端触发时机** (`Edit/index.tsx:484-491`)：
 
 ```typescript
+const currentTime = Date.now()
+const timeSinceLastUpdate = currentTime - editSessionStartTime
+
+// 每 10 秒才会触发一次锁续期
+const updateLastEdited = isLockingEnabled && timeSinceLastUpdate >= 10000 // 10 seconds
+
+if (updateLastEdited) {
+  setEditSessionStartTime(currentTime)
+}
+```
+
+**服务端调用参数**：
+```typescript
+const result = await getFormState({
+  // ... 其他参数
+  returnLockStatus: isLockingEnabled,   // 是否返回锁状态
+  updateLastEdited,                      // 是否更新锁时间（每10秒一次）
+})
+```
+
+**锁的完整生命周期**：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        锁的生命周期                                    │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  1. 锁的创建 (Create)                                                │
+│     ┌─────────────────────────────────────────────────────────┐    │
+│     │ 用户A打开文档编辑页 → 首次字段变更触发 onChange         │    │
+│     │ → 调用 getFormState(updateLastEdited=true)             │    │
+│     │ → 服务端创建/更新 payload-locked-documents 记录        │    │
+│     │ → 返回 lockedState 给前端                                │    │
+│     └─────────────────────────────────────────────────────────┘    │
+│                              ↓                                        │
+│  2. 锁的续期 (Renew)                                                  │
+│     ┌─────────────────────────────────────────────────────────┐    │
+│     │ 用户A持续编辑，每 10 秒                                  │    │
+│     │ → 触发 updateLastEdited=true                            │    │
+│     │ → 更新锁记录的 updatedAt 字段                            │    │
+│     │ → 锁过期时间 = updatedAt + duration (默认5分钟)         │    │
+│     └─────────────────────────────────────────────────────────┘    │
+│                              ↓                                        │
+│  3. 锁的释放 (Release)                                                │
+│     ┌─────────────────────────────────────────────────────────┐    │
+│     │ 方式A：保存/发布文档                                      │    │
+│     │   onSave 成功后 → setDocumentIsLocked(false)            │    │
+│     │                                                          │    │
+│     │ 方式B：离开编辑页面                                       │    │
+│     │   handleLeaveConfirm → unlockDocument API 调用          │    │
+│     │                                                          │    │
+│     │ 方式C：锁过期                                             │    │
+│     │   当前时间 > updatedAt + lockDuration                   │    │
+│     │   → 其他用户可获取锁                                     │    │
+│     └─────────────────────────────────────────────────────────┘    │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**锁过期判断逻辑** (`Edit/index.tsx:191-192`)：
+```typescript
+const lockExpiryTime = lastUpdateTime + lockDurationInMilliseconds
+const isLockExpired = Date.now() > lockExpiryTime
+```
+
+#### 3.1.4 写入前锁校验流程
+
+**服务端校验函数** (`packages/payload/src/utilities/checkDocumentLockStatus.ts`)
+
+**核心参数**：
+```typescript
+export const checkDocumentLockStatus = async ({
+  id,
+  collectionSlug,
+  globalSlug,
+  lockDurationDefault = 300,  // 默认 5 分钟
+  lockErrorMessage,
+  overrideLock = true,         // ⚠️ 关键：默认绕过锁检查！
+  req,
+}: CheckDocumentLockStatusArgs): Promise<void>
+```
+
+**校验流程详解**：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    checkDocumentLockStatus 执行流程                   │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  第1步：检查锁定功能是否启用                                          │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │ const isLockingEnabled = lockDocumentsProp !== false        │  │
+│  │ if (!isLockingEnabled) return                                 │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                              ↓                                        │
+│  第2步：检查 overrideLock 参数                                       │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │ if (overrideLock === true) {                                 │  │
+│  │   // ⚠️ 直接跳过锁检查！                                      │  │
+│  │   // 但仍会执行第4步：删除过期锁                              │  │
+│  │   跳到第4步                                                   │  │
+│  │ }                                                             │  │
+│  │ else {                                                        │  │
+│  │   // overrideLock === false → 执行严格的锁检查               │  │
+│  │   继续第3步                                                   │  │
+│  │ }                                                             │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                              ↓                                        │
+│  第3步：严格锁检查 (仅当 overrideLock=false 时)                      │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │ 3.1 查询锁定记录                                              │  │
+│  │     where: {                                                 │  │
+│  │       'document.relationTo': collectionSlug,                │  │
+│  │       'document.value': id,                                  │  │
+│  │       updatedAt: { greater_than: now - lockDuration }      │  │
+│  │     }                                                         │  │
+│  │                                                              │  │
+│  │ 3.2 检查锁定者                                                │  │
+│  │     ├─ 无锁定记录 → 允许写入 ✓                               │  │
+│  │     ├─ 锁定者是当前用户 → 允许写入 ✓                         │  │
+│  │     └─ 锁定者是其他用户 → 抛出 Locked 错误 ✗                │  │
+│  │                                                              │  │
+│  │ 抛出的错误信息：                                              │  │
+│  │ "Document with ID ${id} is currently locked by another     │  │
+│  │  user and cannot be updated."                               │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                              ↓                                        │
+│  第4步：删除过期锁 (无论 overrideLock 是什么，都会执行)              │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │ 删除所有过期的锁定记录：                                      │  │
+│  │ updatedAt < now - lockDuration                               │  │
+│  │                                                              │  │
+│  │ 这一步很重要：防止锁记录无限积累，保持数据库清洁              │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.1.5 锁参数配置详解
+
+```typescript
+// 集合/Global 配置中的 lockDocuments 选项
+
+// 方式1：默认启用 (不写任何配置)
+// lockDocuments 未定义 → 等同于 lockDocuments: true
+// 默认锁持续时间：300 秒 (5 分钟)
+
+// 方式2：明确启用，自定义时长
+lockDocuments: {
+  duration: 600,  // 10 分钟，单位：秒
+}
+
+// 方式3：明确禁用
+lockDocuments: false
+```
+
+**锁持续时间计算** (`checkDocumentLockStatus.ts:82-86`)：
+```typescript
+const lockDocumentsProp = collectionConfig?.lockDocuments
+
+const lockDuration =
+  typeof lockDocumentsProp === 'object' 
+    ? lockDocumentsProp.duration 
+    : lockDurationDefault  // 300 秒
+
+const lockDurationInMilliseconds = lockDuration * 1000
+```
+
+---
+
+### 3.2 哪些操作会绕过锁校验
+
+#### 3.2.1 关键发现：overrideLock 默认值
+
+**Local API 的默认行为** (`collections/operations/local/update.ts:86-90`)：
+
+```typescript
+/**
+ * By default, document locks are ignored (`true`). 
+ * Set to `false` to enforce locks and prevent operations 
+ * when a document is locked by another user.
+ * 
+ * @default true  // ⚠️ 默认绕过锁检查！
+ */
+overrideLock?: boolean
+```
+
+**这是一个极其重要的设计决策**：
+- **默认情况下，Local API 调用会绕过所有锁检查**
+- 只有显式设置 `overrideLock: false` 才会强制执行锁校验
+
+#### 3.2.2 各层 API 的 overrideLock 行为
+
+| API 层 | overrideLock 默认值 | 行为说明 |
+|--------|---------------------|---------|
+| **Local API** | `true` | 默认绕过锁检查；需显式设为 `false` 才检查 |
+| **REST API** | 从 query 参数解析 | `/api/posts/123?overrideLock=false` |
+| **GraphQL API** | 从变量解析 | mutation { updatePost(overrideLock: false, ...) } |
+| **Admin UI 保存/更新** | 未显式传递 → undefined | 需要追踪实际调用链 |
+
+#### 3.2.3 会执行锁检查的操作
+
+**服务端哪些操作调用了 `checkDocumentLockStatus`？**
+
+通过搜索源码，以下操作会调用锁检查：
+
+| 操作 | 文件位置 | 锁检查目的 |
+|------|---------|-----------|
+| **update (Collection)** | `collections/operations/utilities/update.ts:133` | 更新文档前检查 |
+| **update (Global)** | `globals/operations/update.ts:185` | 更新 Global 前检查 |
+| **deleteByID** | `collections/operations/deleteByID.ts:135` | 删除文档前检查 |
+| **delete** | `collections/operations/delete.ts:155` | 批量删除前检查 (每条记录) |
+
+**调用示例** (`update.ts:133-139`)：
+```typescript
+await checkDocumentLockStatus({
+  id,
+  collectionSlug: collectionConfig.slug,
+  lockErrorMessage: `Document with ID ${id} is currently locked by another user and cannot be updated.`,
+  overrideLock,  // 传入的参数
+  req,
+})
+```
+
+#### 3.2.4 实际场景分析
+
+**场景1：Admin UI 中用户 A 编辑，用户 B 尝试保存**
+
+```
+Admin UI 保存请求流程：
+1. 前端 Form 提交 PATCH 请求
+2. REST API endpoint 接收
+3. parseParams 解析 query 参数
+   - overrideLock 从 URL query 读取
+   - 如果 URL 中没有 ?overrideLock=xxx，则为 undefined
+4. 调用 local update 操作
+   - Local API 中 overrideLock 也是 undefined
+5. 调用 checkDocumentLockStatus
+   - overrideLock 默认 true (checkDocumentLockStatus.ts:24)
+   - 所以会绕过锁检查？？？
+```
+
+**等等，这和预期不符。让我重新追踪 Admin UI 的实际调用...**
+
+从前端 `Edit/index.tsx` 的 `onSave` 回调来看：
+- 它调用的是 Form 的 `action` (REST API)
+- 但 Form 的提交可能没有显式传递 `overrideLock`
+
+**但从测试用例 `e2e.spec.ts` 来看**，锁确实在 Admin UI 中生效了。让我查看测试中的描述：
+
+```typescript
+// e2e.spec.ts 中的测试描述了：
+// - 用户A编辑文档时会创建锁
+// - 用户B尝试编辑时会看到 "Document Locked" 模态框
+// - 用户B只能选择：Go Back / View Read-Only / Take Over
+```
+
+**实际机制**：
+
+Admin UI 的锁保护是**双层的**：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Admin UI 锁保护机制                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  第一层：前端保护 (强保护)                                        │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │ 1. 用户打开编辑页时，通过 getFormState 获取 lockedState   │  │
+│  │ 2. 如果被其他用户锁定：                                    │  │
+│  │    - 显示 "Document Locked" 模态框                        │  │
+│  │    - 用户选择 "View Read-Only" 时：                       │  │
+│  │      → setIsReadOnlyForIncomingUser(true)                 │  │
+│  │      → Form 被禁用 (disabled=true)                        │  │
+│  │      → 所有输入字段 disabled                                │  │
+│  │      → 保存按钮 disabled                                   │  │
+│  │ 3. 用户根本无法提交请求！                                   │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  第二层：服务端保护 (弱保护，需显式配置)                         │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │ 需要显式传递 overrideLock: false 才会检查                 │  │
+│  │ Admin UI 的 REST 调用可能没有传递这个参数                  │  │
+│  │ 所以主要依靠前端第一层保护                                  │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键代码** (`Edit/index.tsx:623-628`)：
+```typescript
+<Form
+  // ...
+  disabled={
+    isReadOnlyForIncomingUser ||  // 被其他用户锁定时设为 true
+    isInitializing || 
+    !hasSavePermission || 
+    isTrashed
+  }
+  // ...
+>
+```
+
+#### 3.2.5 Take Over (抢占编辑权) 机制
+
+当用户 B 看到 "Document Locked" 模态框时，有三个选项：
+
+1. **Go Back**：返回列表页，不做任何操作
+2. **View Read-Only**：以只读模式查看文档
+3. **Take Over**：抢占编辑权
+
+**Take Over 的实现** (`handleTakeOver.tsx`)：
+
+```typescript
+export const handleTakeOver = async ({
+  id,
+  collectionSlug,
+  globalSlug,
+  updateDocumentEditor,  // 关键函数：更新锁的拥有者
+  user,                   // 当前用户
+  // ...
+}: HandleTakeOverParams): Promise<void> => {
+  
+  // 调用 updateDocumentEditor 将锁的拥有者改为当前用户
+  await updateDocumentEditor(id, collectionSlug ?? globalSlug, user)
+  
+  // 更新前端状态
+  documentLockStateRef.current = {
+    hasShownLockedModal: true,
+    isLocked: true,
+    user,  // 现在是当前用户
+  }
+  setCurrentEditor(user)
+  setIsReadOnlyForIncomingUser(false)  // 解除只读
+}
+```
+
+**被抢占用户的体验**：
+- 用户 A 继续编辑时，前端会检测到 `lockedState.user` 变化
+- 显示 "Document Take Over" 模态框
+- 用户 A 只能选择：Go Back / View Read-Only
+
+**关键检测代码** (`Edit/index.tsx:212-247`)：
+```typescript
+const handleDocumentLocking = useCallback(
+  (lockedState: LockedState) => {
+    const previousOwnerID = ...
+    
+    if (lockedState && lockedState.user) {
+      const lockedUserID = ...
+      
+      // 检测到编辑权被抢占
+      if (previousOwnerID === user.id && lockedUserID !== user.id) {
+        setShowTakeOverModal(true)
+        documentLockState.current.hasShownLockedModal = true
+      }
+      // ...
+    }
+  },
+  [...]
+)
+```
+
+---
+
+### 3.3 并发写入冲突处理
+
+#### 3.3.1 乐观锁策略 (Autosave 场景)
+
+在 `updateLatestVersion.ts` 中实现了针对 autosave 的并发冲突检测：
+
+```typescript
+// packages/payload/src/versions/updateLatestVersion.ts
+
 try {
-  // 尝试更新最新版本
-  return await payload.db.updateVersion({...})
+  // 尝试更新最新的 autosave 版本
+  return await payload.db.updateVersion({
+    collection,
+    data: versionData,
+    id: latestVersion.id,
+    locale,
+    req,
+  })
 } catch (err) {
   versionUpdateFailed = true
   payload.logger.warn({
@@ -264,45 +694,46 @@ try {
   })
 }
 
-// 冲突解决：检查是否已有并发写入成功
+// 冲突解决策略
 if (versionUpdateFailed) {
   // 重新查询最新版本
-  const [freshVersion] = freshDocs
+  const freshVersions = await payload.db.findVersions({
+    collection,
+    limit: 1,
+    locale,
+    pagination: false,
+    req,
+    sort: '-updatedAt',
+    where: versionWhere,
+  })
   
-  // 如果 updatedAt 比我们读取时新，说明并发请求已成功
+  const [freshVersion] = freshVersions.docs
+  
+  // 如果最新版本的 updatedAt 比我们读取时新，
+  // 说明并发请求已经成功更新了版本
   if (freshVersion && new Date(freshVersion.updatedAt) > new Date(latestVersion.updatedAt)) {
-    return freshVersion  // 返回并发请求的结果
+    return freshVersion  // 返回并发请求的结果，视为成功
   }
 }
 ```
 
-#### 3.2.2 冲突处理策略
+**设计意图**：
+- Autosave 是高频操作，不应该让用户看到错误
+- 如果并发请求已成功，直接返回那个结果即可
+- 数据不会丢失，只是"后写入"的请求返回"先写入"的结果
 
-| 场景 | 处理方式 | 结果 |
-|------|---------|------|
-| A获取锁 → A写入 | 正常流程 | A成功 |
-| A获取锁 → B尝试获取 | 检查锁，B被拒绝 | B收到 Locked 错误 |
-| A锁过期 → B获取锁 | 清除过期锁，B获取 | B成功 |
-| 并发 autosave 更新 | 乐观锁检测 | 一方成功，另一方返回成功结果 |
+#### 3.3.2 冲突处理策略汇总
 
-### 3.3 覆盖锁选项 (Override Lock)
+| 场景 | 层级 | 处理方式 | 结果 |
+|------|------|---------|------|
+| A获取锁 → A写入 | 前端+服务端 | 正常流程 | A成功 |
+| A获取锁 → B尝试编辑 | 前端 | 显示锁定模态框 | B无法编辑 |
+| B选择 Take Over | 前端+服务端 | 更新锁拥有者 | B获得编辑权 |
+| A继续编辑 | 前端 | 检测到锁变化 | 显示被抢占模态框 |
+| 并发 autosave | 服务端 | 乐观锁检测 | 一方成功，另一方返回成功结果 |
+| A锁过期 → B获取锁 | 前端+服务端 | 清除过期锁 | B获得编辑权 |
 
-**参数**：`overrideLock: boolean`
-
-```typescript
-// updateDocument.ts:133-139
-await checkDocumentLockStatus({
-  id,
-  collectionSlug: collectionConfig.slug,
-  lockErrorMessage: `Document with ID ${id} is currently locked by another user and cannot be updated.`,
-  overrideLock,
-  req,
-})
-```
-
-**使用场景**：
-- `overrideLock: true`：跳过锁检查（Admin UI 内部操作、API 手动调用）
-- `overrideLock: false`：严格检查锁（用户编辑操作）
+---
 
 ### 3.4 事务支持
 
