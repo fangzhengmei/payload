@@ -182,8 +182,9 @@ const isSavingDraft =
 
 **清理逻辑** (`enforceMaxVersions.ts`)：
 1. 每次创建新版本后检查
-2. 超过限制时删除最旧的非 autosave 版本
-3. 设为 0 表示不限制
+2. 用 `updatedAt` 倒序找到第 `max + 1` 条记录作为截断点
+3. 删除该截断点及更旧的版本记录；逻辑本身不会单独排除 autosave
+4. 设为 0 表示不限制
 
 ### 2.7 本地化状态 (Localize Status)
 
