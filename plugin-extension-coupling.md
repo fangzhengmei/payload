@@ -442,22 +442,128 @@ export const createPayloadRequest = async ({
 // 在路由匹配阶段确定集合后
 if (collection) {
   req.routeParams.collection = collection.config.slug
-  // 注意：req.collection 是在 PayloadRequest 类型中定义的可选属性
-  // 在运行时通过 routeParams.collection 可以找到对应的集合
+} else if (globalConfig) {
+  req.routeParams.global = globalConfig.slug
 }
 ```
 
-**不同作用域的请求上下文对比**：
+**重要校正**：PayloadRequest 类型中**不存在** `req.collection` 和 `req.global` 属性。
+
+**文件位置**: `packages/payload/src/types/index.ts:30-94`
+
+```typescript
+export type CustomPayloadRequestProperties = {
+  context: RequestContext
+  fallbackLocale?: TypedFallbackLocale
+  i18n: I18n
+  locale?: 'all' | TypedLocale
+  payload: typeof payload
+  payloadAPI: 'GraphQL' | 'local' | 'REST'
+  payloadDataLoader: { ... } & DataLoader
+  payloadUploadSizes?: Record<string, Buffer>
+  query: Record<string, unknown>
+  responseHeaders?: Headers
+  routeParams?: Record<string, unknown>   // 只有这个！
+  t: TFunction
+  transactionID?: number | Promise<number | string> | string
+  user: null | TypedUser
+} & Pick<URL, 'hash' | 'host' | 'href' | 'origin' | 'pathname' | 'port' | 'protocol' | 'search' | 'searchParams'>
+
+export interface PayloadRequest
+  extends CustomPayloadRequestProperties,
+    Partial<Request>,
+    PayloadRequestData {
+  headers: Request['headers']
+}
+```
+
+**不同作用域的请求上下文对比（校正版）**：
 
 | 属性 | 全局端点 | 集合级端点 | 全局级端点 |
 |------|---------|-----------|-----------|
 | `req.payload` | ✅ Payload 实例 | ✅ Payload 实例 | ✅ Payload 实例 |
 | `req.routeParams` | `{}` 或路径参数 | `{ collection: 'posts', ... }` | `{ global: 'site-settings', ... }` |
-| `req.collection` | `null` | 集合配置对象 | `null` |
-| `req.global` | `null` | `null` | 全局配置对象 |
+| `req.collection` | ❌ 不存在 | ❌ 不存在 | ❌ 不存在 |
+| `req.global` | ❌ 不存在 | ❌ 不存在 | ❌ 不存在 |
 | `req.user` | ✅ 认证用户 | ✅ 认证用户 | ✅ 认证用户 |
 | `req.query` | ✅ 解析后的查询 | ✅ 解析后的查询 | ✅ 解析后的查询 |
 | `req.payloadDataLoader` | ✅ DataLoader | ✅ DataLoader | ✅ DataLoader |
+| `req.data` | ⚠️ 需要手动解析 | ⚠️ 需要手动解析 | ⚠️ 需要手动解析 |
+
+**关键注意事项**：
+
+1. **获取集合/全局配置的正确方式**：
+```typescript
+// 集合级端点：通过 routeParams 间接获取
+const collectionSlug = req.routeParams?.collection as string
+const collection = req.payload.collections[collectionSlug]
+
+// 全局级端点：通过 routeParams 间接获取
+const globalSlug = req.routeParams?.global as string
+const globalConfig = req.payload.globals.config.find(g => g.slug === globalSlug)
+```
+
+2. **req.data 的手动解析**：
+**文件位置**: `packages/payload/src/types/index.ts:95-119`
+
+```typescript
+type PayloadRequestData = {
+  /**
+   * Data from the request body
+   *
+   * Within Payload operations, i.e. hooks, data will be there
+   * BUT in custom endpoints it will not be, you will need to
+   * use either:
+   *  1. `const data = await req.json()`
+   *
+   *  2. import { addDataAndFileToRequest } from 'payload'
+   *     `await addDataAndFileToRequest(req)`
+   */
+  data?: Record<string, unknown>
+  file?: { clientUploadContext?: unknown } & File
+  files?: Record<string, File | File[]>
+}
+```
+
+**自定义端点中获取请求数据**：
+```typescript
+// 方式 1：手动解析
+handler: async (req) => {
+  const data = await req.json()
+  // ...
+}
+
+// 方式 2：使用 addDataAndFileToRequest
+import { addDataAndFileToRequest } from 'payload'
+
+handler: async (req) => {
+  await addDataAndFileToRequest(req)
+  const data = req.data  // 现在可以直接使用
+  const file = req.file
+  // ...
+}
+```
+
+3. **getRequestCollection 工具函数**：
+**文件位置**: `packages/payload/src/utilities/getRequestEntity.ts:7-18`
+
+```typescript
+export const getRequestCollection = (req: PayloadRequest): Collection => {
+  const collectionSlug = req.routeParams?.collection
+  
+  if (typeof collectionSlug !== 'string') {
+    throw new APIError(`No collection was specified`, 400)
+  }
+  
+  const collection = req.payload.collections[collectionSlug]
+  
+  if (!collection) {
+    throw new APIError(`Collection with the slug ${collectionSlug} was not found`, 404)
+  }
+  
+  return collection
+}
+```
 
 #### 4.2.5 端点处理器的访问控制
 
@@ -1093,7 +1199,236 @@ const endpoint = endpoints?.find((endpoint) => {
 
 ---
 
-### 8.3 冲突矩阵与后果
+### 8.3 冲突的实际运行时后果深度分析
+
+#### 8.3.1 场景 1: 多插件注入相同 slug 的集合
+
+**场景描述**：
+- 插件 A 注入集合 `slug: 'products'`
+- 插件 B 也注入集合 `slug: 'products'`
+
+**实际后果**：
+
+| 阶段 | 行为 | 表现 |
+|------|------|------|
+| **插件执行阶段** | 两个集合都被添加到 `config.collections` 数组 | 无警告 |
+| **sanitizeConfig 阶段** | 检测到重复 slug | ✅ 抛出 `DuplicateCollection` 错误 |
+| **应用启动** | 阻止启动 | ❌ 无法启动 |
+
+**错误信息**：
+```
+DuplicateCollection: Collection slug already in use: "products"
+```
+
+**预防方案**：
+```typescript
+// 方案 1: 命名空间前缀
+const productsCollection = { slug: 'myPlugin_products', ... }
+
+// 方案 2: 条件性注入
+const existing = config.collections?.find(c => c.slug === 'products')
+if (!existing) {
+  config.collections!.push(productsCollection)
+}
+
+// 方案 3: 允许用户自定义 slug（如 plugin-ecommerce）
+const productsCollection = { 
+  slug: pluginConfig.collections?.productsSlug || 'products',
+  ... 
+}
+```
+
+#### 8.3.2 场景 2: 多插件注入相同路径的端点
+
+**场景描述**：
+- 插件 A 注入端点：`path: '/api/export', method: 'get'`
+- 插件 B 也注入端点：`path: '/api/export', method: 'get'`
+
+**实际后果**：
+
+| 阶段 | 行为 | 表现 |
+|------|------|------|
+| **插件执行阶段** | 两个端点都被 push 到数组 | 无警告 |
+| **sanitizeConfig 阶段** | 无检测 | 无错误 |
+| **运行时路由匹配** | 数组中第一个匹配的被使用 | 插件 A 的端点生效，B 的被忽略 |
+| **开发者体验** | 无声失败 | 难以调试 |
+
+**具体流程**：
+```typescript
+// 插件执行后
+config.endpoints = [
+  { path: '/export', handler: handlerA },  // 插件 A (order=1)
+  { path: '/export', handler: handlerB },  // 插件 B (order=10)
+  // ... 默认端点
+]
+
+// 运行时 handleEndpoints.ts
+const endpoint = endpoints.find(e => e.path === '/export')
+// ✅ 返回第一个（handlerA）
+// ❌ handlerB 永远不会被调用
+```
+
+**预防方案**：
+```typescript
+// 方案 1: 路径命名空间
+path: '/api/my-plugin/export'
+
+// 方案 2: 检查现有端点
+const existingEndpoint = config.endpoints?.find(
+  e => e.path === '/export' && e.method === 'get'
+)
+if (!existingEndpoint) {
+  config.endpoints!.push(myEndpoint)
+}
+```
+
+#### 8.3.3 场景 3: 多插件覆盖同一对象属性
+
+**场景描述**：
+- 插件 A 设置：`config.admin.theme = 'dark'`
+- 插件 B 设置：`config.admin.theme = 'light'`
+
+**实际后果**：
+
+| 执行顺序 | 插件 | 操作 | 结果 |
+|---------|------|------|------|
+| 1 | 插件 A | `config.admin.theme = 'dark'` | `theme = 'dark'` |
+| 2 | 插件 B | `config.admin.theme = 'light'` | `theme = 'light'` ✅ 覆盖 |
+
+**关键：展开运算符的重要性**：
+
+```typescript
+// ❌ 危险：直接赋值可能丢失其他插件的修改
+plugin: ({ config }) => ({
+  ...config,
+  admin: {
+    theme: 'dark',  // 丢失了其他插件可能设置的 components、avatar 等
+  }
+})
+
+// ✅ 安全：展开运算符保留现有配置
+plugin: ({ config }) => ({
+  ...config,
+  admin: {
+    ...config.admin,      // 保留其他插件的修改
+    theme: 'dark',        // 只覆盖 theme
+  }
+})
+```
+
+**嵌套对象的注意事项**：
+```typescript
+// ❌ 两层覆盖丢失
+plugin: ({ config }) => ({
+  ...config,
+  admin: {
+    ...config.admin,
+    components: {
+      Nav: '/components/MyNav.tsx',  // 丢失其他组件配置！
+    }
+  }
+})
+
+// ✅ 完全展开
+plugin: ({ config }) => ({
+  ...config,
+  admin: {
+    ...config.admin,
+    components: {
+      ...config.admin?.components,    // 保留其他组件
+      Nav: '/components/MyNav.tsx',
+    }
+  }
+})
+```
+
+#### 8.3.4 场景 4: 多插件添加相同组件路径到 importMap
+
+**场景描述**：
+- 插件 A 配置：`Nav: '/components/NavA.tsx'`
+- 插件 B 配置：`Nav: '/components/NavA.tsx'`（相同路径）
+
+**实际后果**：
+
+| 阶段 | 行为 | 表现 |
+|------|------|------|
+| **importMap 生成** | 检测到重复 key | 静默跳过，第一个被保留 |
+| **客户端配置** | `config.admin.components.Nav` 被后执行的插件覆盖 | 插件 B 的配置生效 |
+| **运行时** | 组件已在 importMap 中 | 正常渲染 |
+
+**关键点**：
+```typescript
+// addPayloadComponentToImportMap.ts
+const key = componentPath + '#' + exportName  // '/components/NavA.tsx#default'
+if (importMap[key]) {
+  return null  // 静默跳过
+}
+```
+
+**如果路径不同但目的相同**：
+```typescript
+// 插件 A: Nav = '/components/NavA.tsx'
+// 插件 B: Nav = '/components/NavB.tsx'
+
+// importMap 中两个都会被导入
+// 但 config.admin.components.Nav 会被后执行的插件覆盖
+// 最终使用 NavB
+```
+
+**预防方案**：
+```typescript
+// 检查现有配置
+if (!config.admin?.components?.Nav) {
+  config.admin = {
+    ...config.admin,
+    components: {
+      ...config.admin?.components,
+      Nav: '/components/MyNav.tsx',
+    }
+  }
+}
+```
+
+#### 8.3.5 场景 5: 多插件添加多个 importMap generators
+
+**场景描述**：
+- 插件 A 添加 generator：扫描 `config.custom.pluginA`
+- 插件 B 添加 generator：扫描 `config.custom.pluginB`
+
+**实际后果**：
+
+| 阶段 | 行为 | 表现 |
+|------|------|------|
+| **插件执行** | 两个 generator 被 push 到数组 | 正常 |
+| **importMap 生成** | 依次执行所有 generator | 两个都正常工作 |
+| **运行时** | 两个插件的组件都被加载 | ✅ 无冲突 |
+
+**这是一种安全的扩展模式**：
+```typescript
+// 插件 A
+plugin: ({ config }) => ({
+  ...config,
+  admin: {
+    ...config.admin,
+    importMap: {
+      ...config.admin?.importMap,
+      generators: [
+        ...(config.admin?.importMap?.generators || []),
+        ({ addToImportMap, config }) => {
+          addToImportMap(config.custom?.pluginA?.component)
+        },
+      ],
+    },
+  },
+})
+
+// 插件 B 类似...
+// 两个 generator 都会被执行，互不干扰
+```
+
+---
+
+### 8.4 冲突矩阵与后果
 
 | 配置类型 | 冲突检测 | 处理策略 | 后果 |
 |---------|---------|---------|------|
