@@ -262,7 +262,65 @@ export type Endpoint = {
 export type PayloadHandler = (req: PayloadRequest) => Promise<Response> | Response
 ```
 
-### 4.2 注册方式
+### 4.2 端点作用域归属深度分析
+
+#### 4.2.1 两种端点作用域
+
+Payload CMS 存在两种不同作用域的端点，它们的路由匹配和请求上下文完全不同：
+
+| 作用域类型 | 配置位置 | 路由前缀 | 请求上下文 | 典型用途 |
+|-----------|---------|---------|-----------|---------|
+| **全局端点** | `config.endpoints` | `/api/{path}` | `req.collection = null` | 系统级操作、跨集合查询 |
+| **集合级端点** | `collection.endpoints` | `/api/{collection-slug}/{path}` | `req.collection = 目标集合` | 特定集合的业务逻辑 |
+| **全局级端点** | `global.endpoints` | `/api/globals/{global-slug}/{path}` | `req.global = 目标全局` | 全局配置的操作 |
+
+#### 4.2.2 路由匹配优先级
+
+**文件位置**: `packages/payload/src/utilities/handleEndpoints.ts:183-193`
+
+```typescript
+let endpoints: Endpoint[] | false = config.endpoints
+
+if (collection) {
+  endpoints = collection.config.endpoints
+  // /posts/route -> /route
+  adjustedPathname = adjustedPathname.replace(`/${collection.config.slug}`, '')
+} else if (globalConfig) {
+  // /header/route -> /route
+  adjustedPathname = adjustedPathname.replace(`/${globalConfig.slug}`, '')
+  endpoints = globalConfig.endpoints!
+}
+```
+
+**匹配逻辑**：
+1. **优先检查是否匹配集合/全局 slug**
+   - 如果 URL 第一段是集合 slug → 使用 `collection.endpoints`
+   - 如果 URL 以 `/globals/` 开头 → 使用 `global.endpoints`
+   - 否则 → 使用 `config.endpoints`（全局端点）
+
+2. **路径调整规则**
+   - 集合级端点：`/api/posts/custom-route` → 去掉 `/posts` → 匹配 `/custom-route`
+   - 全局级端点：`/api/globals/site-settings/export` → 去掉 `/site-settings` → 匹配 `/export`
+   - 全局端点：`/api/public/stats` → 直接匹配 `/public/stats`
+
+#### 4.2.3 请求上下文差异
+
+**集合级端点的 `req.routeParams`**：
+```typescript
+// 注入集合 slug 到 routeParams
+if (collection) {
+  req.routeParams.collection = collection.config.slug
+} else if (globalConfig) {
+  req.routeParams.global = globalConfig.slug
+}
+```
+
+**关键区别**：
+- 集合级端点可以直接操作 `req.collection`，获取集合配置和字段
+- 全局端点需要自行处理集合选择逻辑
+- 集合级端点的 access control 会自动应用集合的权限策略
+
+### 4.3 端点注册方式
 
 插件通过修改 `config.endpoints` 数组注册自定义端点。
 
@@ -313,14 +371,14 @@ paymentMethods.forEach((paymentMethod) => {
 })
 ```
 
-### 4.3 端点路径规范
+### 4.4 端点路径规范
 
 - 路径以 `/` 开头
 - 支持路径参数（如 `/api/orders/:id`）
 - 最终访问路径 = `serverURL` + `routes.api` + `endpoint.path`
 - 示例: `http://localhost:3000/api/plugin-seo/generate-title`
 
-### 4.4 处理器（Handler）
+### 4.5 处理器（Handler）
 
 **PayloadRequest 对象**:
 ```typescript
