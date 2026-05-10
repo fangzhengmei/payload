@@ -268,11 +268,13 @@ export type PayloadHandler = (req: PayloadRequest) => Promise<Response> | Respon
 
 Payload CMS 存在三种不同作用域的端点，它们的路由匹配、请求上下文和处理流程完全不同：
 
-| 作用域类型 | 配置位置 | 路由前缀 | 请求上下文 | 典型用途 |
-|-----------|---------|---------|-----------|---------|
-| **全局端点** | `config.endpoints` | `/api/{path}` | `req.collection = null` | 系统级操作、跨集合查询 |
-| **集合级端点** | `collection.endpoints` | `/api/{collection-slug}/{path}` | `req.collection = 目标集合` | 特定集合的业务逻辑 |
-| **全局级端点** | `global.endpoints` | `/api/globals/{global-slug}/{path}` | `req.global = 目标全局` | 全局配置的操作 |
+| 作用域类型 | 配置位置 | 路由前缀 | 路由参数（req.routeParams） | 典型用途 |
+|-----------|---------|---------|---------------------------|---------|
+| **全局端点** | `config.endpoints` | `/api/{path}` | `{}` 或端点路径参数 | 系统级操作、跨集合查询 |
+| **集合级端点** | `collection.endpoints` | `/api/{collection-slug}/{path}` | `{ collection: 'posts', ... }` + 路径参数 | 特定集合的业务逻辑 |
+| **全局级端点** | `global.endpoints` | `/api/globals/{global-slug}/{path}` | `{ global: 'site-settings', ... }` + 路径参数 | 全局配置的操作 |
+
+**重要说明**：`PayloadRequest` 类型中**不存在** `req.collection` 和 `req.global` 属性。集合/全局信息是通过 `req.routeParams.collection` 和 `req.routeParams.global` 注入的。
 
 #### 4.2.2 路由匹配优先级和决策树
 
@@ -1428,22 +1430,24 @@ plugin: ({ config }) => ({
 
 ---
 
-### 8.4 冲突矩阵与后果
+### 8.4 冲突矩阵与后果分类
 
-| 配置类型 | 冲突检测 | 处理策略 | 后果 |
-|---------|---------|---------|------|
-| `collections[].slug` | ✅ 严格检测 | 抛出 `DuplicateCollection` 错误 | 应用无法启动，必须修复 |
-| `endpoints[]` (相同路径+方法) | ❌ 无检测 | 数组顺序决定，先匹配优先 | 后添加的端点被静默忽略 |
-| `admin.theme` | ❌ 无检测 | 后执行覆盖 | 最后一个插件的设置生效 |
-| `admin.components.Nav` | ❌ 无检测 | 后执行覆盖 | 最后一个插件的组件生效 |
-| `typescript.schema[]` | ❌ 无检测 | 全部执行 | 多个类型生成器依次处理 |
-| `i18n.translations` | 使用 `deepMergeSimple` | 深度合并 | 冲突键后写入的值生效 |
-| 组件路径 (importMap) | ✅ 路径+导出名去重 | 静默跳过重复 | 第一个注册的组件路径生效 |
-| `config.custom` | ❌ 无检测 | 后执行覆盖 | 最后一个插件的自定义数据生效 |
+| 配置类型 | 冲突检测 | 处理策略 | 后果类型 | 实际影响 |
+|---------|---------|---------|---------|---------|
+| `collections[].slug` | ✅ 严格检测（sanitizeConfig） | 抛出 `DuplicateCollection` 错误 | 🔴 **启动阻断** | 应用无法启动，必须修复 |
+| `endpoints[]` (相同路径+方法) | ❌ 无检测 | 数组顺序决定，先匹配优先 | 🟡 **静默失效** | 后添加的端点永远不会被调用 |
+| `admin.theme` | ❌ 无检测 | 后执行覆盖 | 🟡 **静默失效** | 先设置的插件的配置被忽略 |
+| `admin.components.Nav` | ❌ 无检测 | 后执行覆盖 | 🟡 **静默失效** | 先执行的插件的组件不会被使用 |
+| `typescript.schema[]` | ❌ 无检测 | 全部执行，顺序执行 | ✅ **无冲突** | 多个类型生成器依次处理 Schema |
+| `i18n.translations` | 使用 `deepMergeSimple` | 深度合并，后写入的值生效 | 🟡 **静默失效** | 冲突键后写入的值覆盖先写入的 |
+| 组件路径 (importMap) | ✅ 路径+导出名去重 | 静默跳过重复，先扫描到的保留 | 🟡 **静默失效（无害）** | 重复组件不会重复导入 |
+| `config.custom` | ❌ 无检测 | 后执行覆盖 | 🟡 **静默失效** | 先写入的自定义数据可能被覆盖 |
+| `importMap.generators[]` | ❌ 无检测 | 全部执行，顺序执行 | ✅ **无冲突** | 多个生成器依次扫描配置 |
+| `dashboard.widgets[]` | ❌ 无检测 | 数组追加 | ✅ **无冲突** | 多个插件的组件都显示 |
 
 ---
 
-### 8.4 插件冲突预防最佳实践
+### 8.5 插件冲突预防最佳实践
 
 #### 实践 1：使用命名空间前缀
 
