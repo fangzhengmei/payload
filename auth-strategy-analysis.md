@@ -93,8 +93,134 @@ JWT 签名/验证时直接使用 TextEncoder.encode(payload.secret)
 
 **关键事实**：
 - SHA-256 + 截断只发生 **一次**（初始化阶段），而非每次 JWT 操作
-- `payload.secret` 始终是 **32 字符的十六进制字符串**（等价于 16 字节二进制数据）
+- `payload.secret` 始终是 **32 字符的十六进制字符串**（字符集：`[0-9a-f]`）
+- JWT 签名/验证时通过 `TextEncoder.encode()` 转为 **32 字节 UTF-8 字节序列** 传入 HMAC-SHA256
+- 从密码学熵角度：每个十六进制字符贡献 4 位熵，总计 **128 位有效熵**
 - 外部服务验证 Payload JWT 时，需要对原始 secret 做相同的预处理（见 `docs/authentication/jwt.mdx`）
+
+### 3.1.1 此表述误判带来的安全判断偏差
+
+> "32 字符十六进制字符串等价于 16 字节二进制数据"——这句看似合理的简化表述，实际会在三个关键维度上误导安全判断。
+
+#### 偏差一：跨服务验签不一致
+
+**误判逻辑**：认为"32 个十六进制字符 = 16 字节"，外部服务验证时可能会：
+```typescript
+// 错误做法：把十六进制字符串解码为二进制
+const secret = crypto
+  .createHash('sha256')
+  .update(process.env.PAYLOAD_SECRET)
+  .digest()           // 32 字节二进制 Buffer
+  .slice(0, 16)       // 截断为 16 字节（因为"32 hex = 16 bytes"）
+```
+
+**真实情况**：Payload 不会解码十六进制，而是直接对字符串做 UTF-8 编码：
+```typescript
+// packages/payload/src/index.ts:844
+this.secret = crypto
+  .createHash('sha256')
+  .update(this.config.secret)
+  .digest('hex')      // 64 字符十六进制字符串
+  .slice(0, 32)       // 32 字符十六进制字符串，例如 "a1b2c3d4..."
+
+// packages/payload/src/auth/jwt.ts:12
+const secretKey = new TextEncoder().encode(secret)
+// 结果：32 字节 UTF-8，每个字符独立编码，例如 [0x61, 0x31, 0x62, 0x32, ...]
+```
+
+**后果**：
+- 外部服务用"十六进制解码"得到的密钥与 Payload 内部使用的密钥完全不同
+- JWT 验证永远失败，且难以排查（两边都声称"用了相同的 secret"）
+- 运维团队可能反复检查 `PAYLOAD_SECRET` 环境变量，却忽略了编码方式差异
+
+**正确做法**：
+```typescript
+// 外部服务必须完全复刻 Payload 的处理逻辑
+const payloadSecret = crypto
+  .createHash('sha256')
+  .update(process.env.PAYLOAD_SECRET)
+  .digest('hex')      // 十六进制字符串
+  .slice(0, 32)       // 保留为字符串，不要 decode
+
+// 然后直接用这个字符串验证 JWT（jose 等库会自动处理编码）
+const { payload } = await jwtVerify(token, new TextEncoder().encode(payloadSecret))
+```
+
+---
+
+#### 偏差二：密钥长度认知偏差
+
+**误判逻辑**：
+- "32 字符十六进制 = 16 字节" → 认为密钥太短，不满足 HS256 的推荐长度（≥ 32 字节）
+- 或者反向：认为既然输入的 `config.secret` 可以很长，最终密钥熵也很高
+
+**真实情况**：需要区分三个概念：
+
+| 概念 | 数值 | 说明 |
+|-----|------|-----|
+| **原始 `config.secret`** | 用户配置 | 可以任意长度，但不决定最终密钥强度 |
+| **`payload.secret` 字符串** | 32 字符 | 十六进制字符，取值范围 `[0-9a-f]` |
+| **传入 HMAC 的字节数** | 32 字节 | `TextEncoder.encode()` 后，每个字符 1 字节 |
+| **密码学有效熵** | **128 位** | 每个十六进制字符 4 位：32 × 4 = 128 位 |
+
+**关键理解**：
+- HS256 的密钥可以是任意长度字节序列，HMAC 会内部处理填充
+- 但**密码学强度取决于熵**，而非字节数
+- 128 位熵对大多数应用足够，但并非"工业级"的 256 位
+- 无论原始 `config.secret` 多长（100 字节、1000 字节），经过 `sha256().digest('hex').slice(0,32)` 后，**有效熵固定为 128 位**
+
+**安全影响**：
+- 如果系统设计依赖"超长 secret 带来的安全边际"，这个假设不成立
+- 128 位对抗量子计算的缓冲区比 256 位小
+- 但配合短期 JWT（默认 2 小时），128 位在可预见未来仍然安全
+
+---
+
+#### 偏差三：排障方向误导
+
+**误判场景**：JWT 验证失败，开发人员开始排查：
+
+| 排查方向（基于误判） | 实际问题 | 浪费的时间 |
+|-------------------|---------|-----------|
+| "是不是 secret 长度不对？检查是不是 32 字节" | 外部服务用了 `Buffer.from(hex, 'hex')` 解码 | 数小时 |
+| "是不是编码问题？试试 base64 / UTF-16" | 问题是十六进制字符串 vs 二进制解码 | 反复试错 |
+| "是不是 Payload 版本差异？旧版本用了不同算法" | 问题是文档理解偏差，而非版本问题 | 查 changelog、回滚测试 |
+
+**典型排障误区**：
+```typescript
+// 开发人员 A 的验证代码（错误）
+const key1 = Buffer.from(payloadSecret.slice(0, 32), 'hex')  // 16 字节！
+
+// 开发人员 B 的验证代码（错误）
+const key2 = crypto.createHash('sha256').update(secret).digest().slice(0, 32)  // 32 字节二进制，不是十六进制
+
+// Payload 实际使用的（正确）
+const key3 = new TextEncoder().encode(payloadSecret)  // 32 字节 UTF-8 字符编码
+```
+
+**这三个密钥完全不同**，但开发人员可能坚信"逻辑是对的"，因为：
+- 都对 `PAYLOAD_SECRET` 做了 SHA-256
+- 都取了 32 的某种形式
+- 文档里说"process secret using SHA-256 hash and takes the first 32 characters"
+
+**快速自检方法**：
+```typescript
+// 验证你的处理逻辑是否正确
+function verifyPayloadSecretProcessing(originalSecret: string): boolean {
+  const processed = crypto
+    .createHash('sha256')
+    .update(originalSecret)
+    .digest('hex')
+    .slice(0, 32)
+  
+  // 检查：应该是 32 个字符，且都是十六进制
+  return processed.length === 32 && /^[0-9a-f]{32}$/.test(processed)
+}
+
+// 然后直接用这个字符串，不要做任何解码
+```
+
+---
 
 ### 3.2 会话机制
 
@@ -490,19 +616,26 @@ export default buildConfig({
 
 ### 7.1 JWT 安全
 
-1. **使用强密钥**：
-   - 密钥长度至少 32 字节
-   - 使用密码学安全的随机数生成器
-   - 定期轮换密钥
+1. **使用强密钥（原始 secret 必须强壮）**
+   - SHA-256 转换是**确定性映射**，不会增强弱密钥的安全性
+   - `config.secret` 应使用密码学安全的随机数生成器（如 `crypto.randomBytes(32)`）
+   - 建议原始长度至少 32 字节（虽然最终被压缩到 128 位熵）
+   - **注意**：最终 `payload.secret` 是 32 字符十六进制字符串（128 位有效熵）
 
-2. **合理设置过期时间**：
+2. **合理设置过期时间**
    - 访问令牌：短期（15 分钟 - 2 小时）
    - 刷新令牌：可设置更长但需可撤销
+   - 128 位密钥配合短期令牌在大多数场景下安全
 
-3. **敏感信息不入 JWT**：
+3. **敏感信息不入 JWT**
    - JWT 是 Base64 编码，非加密
    - 不要在 JWT 中存储密码、信用卡号等敏感信息
    - 使用 `saveToJWT` 控制哪些字段进入令牌
+
+4. **外部服务验证必须复刻预处理**
+   - 外部服务验证 Payload JWT 时，必须先对原始 secret 做相同预处理
+   - 流程：`SHA-256 → 十六进制 → 取前 32 字符`
+   - 见 7.5.4 节的代码示例
 
 ### 7.2 会话安全
 
