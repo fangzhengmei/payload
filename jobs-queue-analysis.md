@@ -278,6 +278,29 @@ export async function countRunnableOrActiveJobsForQueue({
 }
 ```
 
+**关键点：仅拦截 `meta.scheduled=true` 的任务**
+
+`defaultBeforeSchedule` 调用 `countRunnableOrActiveJobsForQueue` 时传入了 `onlyScheduled: true`，这意味着：
+
+| 任务来源 | `meta.scheduled` 值 | 是否被拦截 |
+|---------|---------------------|-----------|
+| 调度系统自动入队 | `true` | ✅ 被拦截检查 |
+| `payload.jobs.queue()` 手动入队 | `undefined` 或用户自定义 | ❌ 不拦截 |
+| Hook 触发入队 | `undefined` 或用户自定义 | ❌ 不拦截 |
+| API 端点入队 | `undefined` 或用户自定义 | ❌ 不拦截 |
+
+**实际影响**：
+```
+场景示例：
+1. 每日 8:00 的定时任务 "dailyDigest" 配置了 `schedule`
+2. 手动调用 `payload.jobs.queue({ task: 'dailyDigest', queue: 'daily' })`
+3. 定时调度检查时，查询条件包含 `{ 'meta.scheduled': { equals: true } }`
+4. 手动入队的任务没有 `meta.scheduled=true`，不在统计范围内
+5. 定时调度仍然可以成功入队一个新的 "dailyDigest" 任务
+
+结果：同队列、同任务可以同时存在两个待处理实例（一个手动，一个定时）
+```
+
 **防重复与 waitUntil 的协同规则**：
 
 | 场景 | `defaultBeforeSchedule` 行为 | 说明 |
@@ -295,6 +318,7 @@ export async function countRunnableOrActiveJobsForQueue({
 - 这意味着只要任务的 `error` 字段不存在（无论 `hasError` 是什么），都算作"可运行"
 - 任务失败后，如果 `hasError=true` 且 `error` 字段被设置，该任务不会阻止新的调度入队
 - **waitUntil 不会参与防重复检查**：即使有任务的 `waitUntil` 还未到期，只要它存在于队列中且未完成、无最终错误，新调度就会被跳过
+- **仅拦截 `meta.scheduled=true` 的任务**：手动或 API 入队的相同任务不会被拦截
 
 **自定义防重复逻辑**：
 
@@ -309,7 +333,7 @@ schedule: [{
       // 可以调用默认逻辑
       const defaultResult = await defaultBeforeSchedule({ queueable, req })
       
-      // 或者自定义检查
+      // 或者自定义检查（不使用 onlyScheduled，拦截所有来源）
       const existingJobs = await req.payload.find({
         collection: 'payload-jobs',
         where: {
@@ -325,6 +349,292 @@ schedule: [{
       return {
         shouldSchedule: existingJobs.totalDocs === 0,
         waitUntil: new Date(queueable.waitUntil.getTime() + 3600000), // 延迟 1 小时
+      }
+    },
+  },
+}]
+```
+
+#### 1.3.7 afterSchedule 与 lastScheduledRun 刷新机制
+
+**默认 afterSchedule 实现**（`defaultAfterSchedule`）：
+
+```typescript
+// packages/payload/src/queues/operations/handleSchedules/defaultAfterSchedule.ts:10-65
+export const defaultAfterSchedule: AfterScheduleFn = async ({ jobStats, queueable, req }) => {
+  const existingQueuesConfig =
+    jobStats?.stats?.scheduledRuns?.queues?.[queueable.scheduleConfig.queue] || {}
+
+  const queueConfig: JobStatsScheduledRuns = {
+    ...existingQueuesConfig,
+  }
+  if (queueable.taskConfig) {
+    ;(queueConfig.tasks ??= {})[queueable.taskConfig.slug] = {
+      lastScheduledRun: getCurrentDate().toISOString(),  // ← 关键：使用当前时间
+    }
+  } else if (queueable.workflowConfig) {
+    ;(queueConfig.workflows ??= {})[queueable.workflowConfig.slug] = {
+      lastScheduledRun: getCurrentDate().toISOString(),  // ← 关键：使用当前时间
+    }
+  }
+
+  // Add to payload-jobs-stats global regardless of the status
+  if (jobStats) {
+    await req.payload.db.updateGlobal({
+      slug: jobStatsGlobalSlug,
+      data: {
+        // ...
+        updatedAt: getCurrentDate().toISOString(),
+      },
+      req,
+      returning: false,
+    })
+  } else {
+    await req.payload.db.createGlobal({
+      // ...
+    })
+  }
+}
+```
+
+**调用时机**（`scheduleQueueable` 函数）：
+
+```typescript
+// packages/payload/src/queues/operations/handleSchedules/index.ts:157-241
+export async function scheduleQueueable(...): Promise<...> {
+  try {
+    // 1. 调用 beforeSchedule
+    const beforeScheduleResult = await (beforeScheduleFn ?? defaultBeforeSchedule)(...)
+
+    if (!beforeScheduleResult.shouldSchedule) {
+      // 状态：skipped → 仍会调用 afterSchedule
+      await (afterScheduleFN ?? defaultAfterSchedule)({
+        status: 'skipped',  // ← 即使跳过也刷新
+        // ...
+      })
+      return { status: 'skipped' }
+    }
+
+    // 2. 入队
+    const job = await req.payload.jobs.queue({ ... })
+
+    // 3. 状态：success → 调用 afterSchedule
+    await (afterScheduleFN ?? defaultAfterSchedule)({
+      status: 'success',  // ← 成功入队后刷新
+      // ...
+    })
+    return { status: 'success' }
+  } catch (error) {
+    // 4. 状态：error → 仍会调用 afterSchedule
+    await (afterScheduleFN ?? defaultAfterSchedule)({
+      status: 'error',  // ← 发生错误也刷新
+      error: error as Error,
+      // ...
+    })
+    return { status: 'error' }
+  }
+}
+```
+
+**关键发现总结**：
+
+| 维度 | 行为 | 代码位置 |
+|------|------|----------|
+| **触发状态** | success、skipped、error 三种状态都会触发 | `scheduleQueueable` 的 try/catch/if 分支 |
+| **写入时间** | `getCurrentDate()`（当前时间），不是 `waitUntil` | `defaultAfterSchedule.ts:19,23` |
+| **写入位置** | `payload-jobs-stats` global | `jobStatsGlobalSlug` |
+
+**对漏跑、补跑和并发调度的影响分析**：
+
+##### 场景 1：漏跑（系统停机/调度进程崩溃）
+
+```
+配置：cron '0 8 * * *'（每天 8:00）
+
+时间线：
+T1: 07:59 - lastScheduledRun = '2026-05-10T08:00:00Z'
+T2: 08:00 - 系统正常运行，调度成功，任务入队
+    → lastScheduledRun 被更新为当前时间 '2026-05-11T08:00:00Z'
+T3: 08:05 - 系统崩溃，任务未执行完成
+T4: 09:00 - 系统恢复，调度进程重新启动
+
+下次调度时间计算：
+nextRun = Cron('0 8 * * *').nextRun(lastScheduledRun='2026-05-11T08:00:00Z')
+        = 2026-05-12T08:00:00Z（明天）
+
+结果：
+- 漏跑的 8:00 任务不会被补跑
+- 下次调度直接跳到明天 8:00
+```
+
+**原因**：`lastScheduledRun` 在 `beforeSchedule` 后立即刷新（无论是否成功执行），漏跑的任务不会被"记住"。
+
+##### 场景 2：补跑能力缺失
+
+```
+配置：cron '*/30 * * * *'（每 30 分钟）
+
+时间线：
+T1: 09:00 - lastScheduledRun = '2026-05-11T09:00:00Z'
+T2: 09:30 - 调度进程停机维护
+T3: 10:15 - 调度进程恢复
+
+计算：
+nextRun = Cron('*/30 * * * *').nextRun(lastScheduledRun='2026-05-11T09:00:00Z')
+        = 2026-05-11T09:30:00Z（错过的 9:30）
+        
+问题：
+1. 09:30 的调度是否会补跑？
+   - depends on 调度进程恢复后何时触发 handleSchedules
+   
+2. 如果 10:15 才触发 handleSchedules：
+   nextRun = 09:30（过去的时间）
+   → 调度仍会触发（checkQueueableTimeConstraints 不会跳过过去的时间）
+   → 入队一个任务（补跑 9:30）
+   → lastScheduledRun 立即更新为 '2026-05-11T10:15:00Z'（当前时间）
+   
+   下一次计算：
+   nextRun = Cron('*/30 * * * *').nextRun('2026-05-11T10:15:00Z')
+           = 2026-05-11T10:30:00Z（正常的 10:30）
+
+结果：
+- 9:30 的任务会补跑（因为 nextRun 是过去时间仍会触发）
+- 但 10:00 的任务被跳过（lastScheduledRun 被刷新到 10:15）
+```
+
+**结论**：Payload 不支持"精确补跑"。短时间停机可能补跑错过的最近一次调度，但长时间停机会导致中间的调度被跳过。
+
+##### 场景 3：并发调度误差（多进程/多实例）
+
+```
+配置：2 个 Worker 实例，都配置了 autoRun 处理调度
+
+时间线：
+T0: lastScheduledRun = '2026-05-11T08:00:00Z'
+    nextRun = 2026-05-11T08:30:00Z（30 分钟后）
+
+T1: 08:30:00.100 - 实例 A 触发 handleSchedules
+    → 读取 lastScheduledRun = '08:00'
+    → 计算 nextRun = '08:30'（已过期）
+    → 开始处理...
+
+T1: 08:30:00.200 - 实例 B 触发 handleSchedules（并发）
+    → 读取 lastScheduledRun = '08:00'（A 还没更新）
+    → 计算 nextRun = '08:30'（已过期）
+    → 开始处理...
+
+T1: 08:30:00.500 - 实例 A 完成：
+    → beforeSchedule 检查通过（无已调度任务）
+    → 入队任务 J1（meta.scheduled=true）
+    → afterSchedule 刷新 lastScheduledRun = '08:30:00.500'（当前时间）
+
+T1: 08:30:00.600 - 实例 B 完成：
+    → beforeSchedule 检查：
+        countRunnableOrActiveJobsForQueue({ onlyScheduled: true })
+        → 发现 J1（meta.scheduled=true, processing=false）
+        → shouldSchedule = false
+    → 状态 skipped
+    → afterSchedule 刷新 lastScheduledRun = '08:30:00.600'（当前时间）
+
+结果：
+- 任务只入队一次（J1），避免了重复调度
+- 但 lastScheduledRun 被刷新了两次，最终值是 '08:30:00.600'
+- 下次调度时间基于 '08:30:00.600' 计算，可能导致微小偏差
+```
+
+**关键保护机制**：`defaultBeforeSchedule` 的 `onlyScheduled: true` 检查可以防止重复入队，但无法防止 `lastScheduledRun` 被多次刷新。
+
+##### 场景 4：调度与执行的时间漂移
+
+```
+配置：cron '0 8 * * *'，任务预计执行 2 小时
+
+时间线：
+Day 1:
+  08:00 - 调度触发，入队任务，lastScheduledRun = '08:00:00'
+  08:01 - 任务开始执行
+  10:00 - 任务完成
+
+Day 2:
+  08:00 - 调度触发：
+    beforeSchedule 检查：
+      countRunnableOrActiveJobsForQueue({ onlyScheduled: true })
+      → 查询：completedAt 不存在 AND error 不存在 AND meta.scheduled=true
+      → 如果 Day 1 的任务已完成（completedAt 存在），应该可以入队
+      
+    问题：
+    - 如果任务还在执行中（processing=true, completedAt 不存在）
+    - beforeSchedule 会返回 shouldSchedule=false
+    - 本次调度被跳过
+    - lastScheduledRun 仍会刷新为当前时间
+
+Day 3:
+  nextRun = Cron('0 8 * * *').nextRun(lastScheduledRun='Day 2 08:00:00')
+          = Day 3 08:00:00
+
+结果：
+- 如果任务执行时间超过调度间隔，可能导致调度被跳过
+- 即使通过并发控制防止，lastScheduledRun 仍会被刷新
+- 可能导致实际执行频率低于预期
+```
+
+**建议与风险应对**：
+
+| 风险场景 | 影响 | 建议措施 |
+|---------|------|----------|
+| **漏跑不补跑** | 计划的调度不会被补执行 | 1. 监控调度成功率<br>2. 关键任务考虑实现自定义补跑逻辑<br>3. 使用更长的调度间隔给任务留足执行时间 |
+| **长时间停机丢失调度** | 中间多个调度窗口被跳过 | 1. 使用外部 Cron（Vercel Cron / Kubernetes CronJob）确保调度触发<br>2. 考虑实现"基于时间段"的任务处理 |
+| **并发调度误差** | 多实例环境下 lastScheduledRun 漂移 | 1. 单实例处理调度（其他只处理执行）<br>2. 或使用数据库锁保护调度逻辑<br>3. 接受微小误差，调度本身不是精确时钟 |
+| **执行超时导致调度跳过** | 任务执行时间 > 调度间隔时跳过 | 1. 预估任务执行时间，设置合理的 cron 间隔<br>2. 长任务使用专用队列，避免影响其他调度<br>3. 监控长时间运行的任务 |
+| **手动入队与定时入队并存** | 同任务可能有多个实例 | 1. 明确区分手动触发和定时触发<br>2. 如需互斥，自定义 beforeSchedule 拦截所有来源 |
+
+**自定义 afterSchedule 示例**：
+
+```typescript
+// 自定义 afterSchedule，实现更精确的调度跟踪
+schedule: [{
+  cron: '*/30 * * * *',
+  queue: 'reports',
+  hooks: {
+    afterSchedule: async ({ 
+      queueable, status, job, req, defaultAfterSchedule 
+    }) => {
+      // 仅在 success 时刷新 lastScheduledRun
+      if (status === 'success') {
+        // 使用 cron 计算的期望时间，而非当前时间
+        const scheduledTime = queueable.waitUntil?.toISOString() 
+          ?? new Date().toISOString()
+        
+        const currentStats = await req.payload.db.findGlobal({
+          slug: 'payload-jobs-stats',
+          req,
+        })
+        
+        await req.payload.db.updateGlobal({
+          slug: 'payload-jobs-stats',
+          data: {
+            ...currentStats,
+            stats: {
+              ...currentStats?.stats,
+              scheduledRuns: {
+                ...currentStats?.stats?.scheduledRuns,
+                queues: {
+                  ...currentStats?.stats?.scheduledRuns?.queues,
+                  [queueable.scheduleConfig.queue]: {
+                    ...currentStats?.stats?.scheduledRuns?.queues?.[queueable.scheduleConfig.queue],
+                    tasks: {
+                      ...currentStats?.stats?.scheduledRuns?.queues?.[queueable.scheduleConfig.queue]?.tasks,
+                      [queueable.taskConfig.slug]: {
+                        lastScheduledRun: scheduledTime,  // 使用期望时间
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          req,
+        })
       }
     },
   },
