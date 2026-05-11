@@ -1440,6 +1440,339 @@ MERGE_SERVER_STATE：
    - 服务端成功后，modified 被设为 false
    - 但如果 onSuccess 回调返回的状态包含 isModified，行为可能不同
 
+### 10.11 提交配置分支对恢复闭环的影响
+
+Payload CMS 有多种提交模式，它们的配置差异会显著影响错误清除和状态重对齐流程。
+
+#### 配置维度
+
+提交配置主要影响两个维度：
+
+| 配置维度 | 选项 | 控制目标 |
+|---------|------|---------|
+| **是否跳过验证** | `skipValidation: true/false` | 提交前是否执行客户端全量验证 |
+| **是否接受服务端值** | `acceptValues: true / { overrideLocalChanges: false }` | 服务端返回值是否覆盖本地值 |
+
+#### 提交模式与配置对应
+
+**实际代码中的配置分布：**
+
+```typescript
+// 1. SaveDraftButton (手动保存草稿)
+await submit({
+  overrides: { _status: 'draft' },
+  skipValidation: true,        // ← 跳过客户端验证
+  // acceptValues 未指定 → 默认 true
+})
+
+// 2. PublishButton (发布)
+await submit({
+  overrides: { _status: 'published' },
+  skipValidation: true,        // ← 跳过客户端验证
+})
+
+// 3. Autosave (自动保存)
+const validateOnDraft = hasDraftValidationEnabled(docConfig)
+await submit({
+  acceptValues: {
+    overrideLocalChanges: false,  // ← 不覆盖本地正在编辑的值
+  },
+  overrides: { _status: 'draft' },
+  skipValidation: !validateOnDraft,  // ← 取决于草稿验证配置
+})
+
+// 4. SaveButton (普通保存)
+// 无特殊配置 → 使用默认值
+// acceptValues = true (默认)
+// skipValidation = false (取决于 disableValidationOnSubmit)
+```
+
+#### 草稿提交配置对校验的影响
+
+草稿提交的验证行为受两个配置控制：
+
+**1. `skipValidation` (客户端跳过验证)**
+
+**位置：** `packages/ui/src/elements/SaveDraftButton/index.tsx:66-73`
+
+```typescript
+// SaveDraftButton 强制跳过客户端验证
+await submit({
+  // ...
+  skipValidation: true,
+})
+```
+
+**影响：**
+- 跳过 `validateForm()` 全量验证
+- 直接发送请求到服务端
+- 错误只能通过服务端返回
+
+**2. `validateDrafts` (草稿验证开关)**
+
+**配置位置：** `versions.drafts.validate`
+
+```typescript
+// 集合配置
+const collectionConfig = {
+  slug: 'posts',
+  versions: {
+    drafts: {
+      validate: true,  // ← 草稿验证开关
+    }
+  }
+}
+```
+
+**运行时影响：**
+
+**位置：** `packages/ui/src/forms/Form/index.tsx:463-469`
+
+```typescript
+// 草稿提交失败后的状态处理
+if (overridesFromArgs['_status'] === 'draft') {
+  setModified(true)  // 保持可重试
+
+  if (!validateDrafts) {
+    setSubmitted(false)  // ← 不显示验证错误 UI
+  }
+}
+```
+
+**草稿验证配置对比：**
+
+| 场景 | `validateDrafts: false` | `validateDrafts: true` |
+|------|------------------------|-----------------------|
+| Autosave skipValidation | `true` (跳过) | `false` (执行验证) |
+| 失败后 `submitted` | `false` (隐藏错误) | `true` (显示错误) |
+| 错误 UI 显示 | ❌ 不显示 | ✅ 显示 |
+| 恢复触发方式 | 用户主动输入 | 错误提示 + 用户输入 |
+| 保存按钮状态 | ✅ 始终可用 | 验证通过后可用 |
+
+**草稿提交的恢复闭环差异：**
+
+```
+validateDrafts: false (宽松模式)
+─────────────────────────────
+服务端失败 → setSubmitted(false) → 错误不显示
+            → setModified(true)  → 可继续编辑
+            → 用户输入 150ms 后 useField 清除 errorMessage
+            → 250ms 后 onChange 清除 errorPaths
+            → 用户可随时再次点击保存草稿
+
+validateDrafts: true (严格模式)
+─────────────────────────────
+服务端失败 → setSubmitted(true) → 错误 UI 显示
+            → setModified(true)  → 可重试
+            → 错误提示引导用户修正
+            → useField + onChange 清除错误
+            → validateForm 需通过才能提交
+```
+
+#### acceptValues 配置对状态重对齐的影响
+
+`acceptValues` 控制提交成功后是否接受服务端返回值覆盖本地值。
+
+**位置：** `packages/ui/src/forms/Form/mergeServerFormState.ts:100-108`
+
+```typescript
+let shouldAcceptValue =
+  incomingField.addedByServer ||
+  acceptValues === true ||
+  (typeof acceptValues === 'object' &&
+    acceptValues !== null &&
+    // 注意：必须是显式 false，null/undefined 视为 true
+    acceptValues.overrideLocalChanges === false &&
+    !currentState[path]?.isModified)
+```
+
+**两种配置的行为对比：**
+
+| 行为 | `acceptValues: true` (默认) | `acceptValues: { overrideLocalChanges: false }` |
+|------|---------------------------|------------------------------------------------|
+| 值覆盖策略 | 服务端是权威，无条件覆盖 | 不覆盖已修改的本地值 |
+| 场景 | 普通保存、发布 | 自动保存 (Autosave) |
+| 数组行合并 | 索引对齐（服务端顺序优先） | ID 匹配（客户端顺序优先） |
+| 初始化值同步 | ✅ 同步 `initialValue` | ❌ 不同步 |
+| 本地修改保护 | ❌ 可能被覆盖 | ✅ 保护本地正在编辑的值 |
+
+**`acceptValues = true` 的状态重对齐流程：**
+
+```
+提交成功 → MERGE_SERVER_STATE
+         → 服务端值覆盖本地值
+         → 服务端 initialValue 覆盖本地
+         → 服务端 rows 顺序覆盖本地顺序
+         → 客户端完全跟随服务端
+         → setModified(false), setSubmitted(false)
+```
+
+**`acceptValues = { overrideLocalChanges: false }` 的状态重对齐流程：**
+
+```
+提交成功 → MERGE_SERVER_STATE
+         → 检查 isModified
+         → 未修改字段：接受服务端值
+         → 已修改字段：保留本地值
+         → 数组行：ID 匹配合并
+         → initialValue：不同步
+         → 用户继续编辑时不受干扰
+```
+
+**数组行合并的差异：**
+
+**位置：** `packages/ui/src/forms/Form/mergeServerFormState.ts:165-209`
+
+```typescript
+if (acceptValues === true) {
+  // 显式保存：服务端是权威，索引对齐
+  newState[path].rows = incomingField.rows.map((serverRow, index) => ({
+    ...(currentState[path]?.rows?.[index] || {}),
+    ...serverRow,
+  }))
+} else {
+  // 自动保存：客户端是权威，ID 匹配
+  newState[path].rows = [...(currentState[path]?.rows || [])]
+  
+  incomingField.rows.forEach((row) => {
+    const indexInCurrentState = currentState[path].rows?.findIndex(
+      (existingRow) => existingRow.id === row.id,
+    )
+    
+    if (indexInCurrentState > -1) {
+      // ID 匹配，合并属性
+      newState[path].rows[indexInCurrentState] = {
+        ...currentState[path].rows[indexInCurrentState],
+        ...row,
+      }
+    } else if (row.addedByServer) {
+      // 服务端新增，追加到末尾
+      newState[path].rows.push(newRow)
+    }
+  })
+}
+```
+
+#### 提交模式完整对比表
+
+| 维度 | 普通保存 (Save) | 保存草稿 (SaveDraft) | 自动保存 (Autosave) | 发布 (Publish) |
+|------|----------------|---------------------|-------------------|---------------|
+| **`skipValidation`** | `false` | `true` | `!validateDrafts` | `true` |
+| **客户端验证** | ✅ `validateForm()` | ❌ 跳过 | 取决于草稿验证配置 | ❌ 跳过 |
+| **`acceptValues`** | `true` (默认) | `true` (默认) | `{ overrideLocalChanges: false }` | `true` (默认) |
+| **值覆盖策略** | 服务端权威 | 服务端权威 | 保护本地修改 | 服务端权威 |
+| **失败后 `submitted`** | `true` | 取决于 `validateDrafts` | 取决于 `validateDrafts` | `true` |
+| **失败后 `modified`** | `false` | `true` (可重试) | `true` (可重试) | `false` |
+| **错误 UI 显示** | ✅ 显示 | ❌ (validateDrafts=false) 或 ✅ | ❌ (validateDrafts=false) 或 ✅ | ✅ 显示 |
+| **恢复触发** | 错误提示 + 用户输入 | 用户主动输入 | 用户继续编辑 | 错误提示 + 用户输入 |
+| **成功后状态对齐** | 完全同步 | 完全同步 | 部分同步（保护本地） | 完全同步 |
+| **典型场景** | 编辑完成后保存 | 随时保存未完成工作 | 后台自动保存 | 正式发布内容 |
+
+#### 配置组合的恢复闭环示例
+
+**示例 1：草稿提交 + validateDrafts: false**
+
+```
+用户操作：点击"保存草稿"按钮
+配置：skipValidation: true, validateDrafts: false
+
+1. 跳过客户端 validateForm()
+2. 发送请求到服务端
+3. 服务端验证失败（如用户名重复）
+4. 客户端处理：
+   - setModified(true)      ← 保持可重试
+   - setSubmitted(false)    ← 不显示错误 UI
+   - ADD_SERVER_ERRORS      ← 但错误已存入 state
+
+恢复闭环：
+- 错误消息已在表单状态中，但 submitted=false 不显示
+- 用户继续编辑，150ms 后 useField 清除 errorMessage
+- 250ms 后 onChange 清除 errorPaths
+- 用户可随时再次点击"保存草稿"
+- 整个过程用户不会看到错误提示
+```
+
+**示例 2：草稿提交 + validateDrafts: true**
+
+```
+用户操作：点击"保存草稿"按钮
+配置：skipValidation: false (Autosave), validateDrafts: true
+
+1. 执行客户端 validateForm()
+2. 如果客户端验证失败 → 阻止提交，显示错误
+3. 如果客户端通过 → 发送请求
+4. 服务端验证失败 → 客户端处理：
+   - setModified(true)      ← 可重试
+   - setSubmitted(true)     ← 显示错误 UI
+   - ADD_SERVER_ERRORS      ← 错误显示
+
+恢复闭环：
+- 错误 UI 立即显示
+- 用户看到红色错误提示
+- 用户修改输入后，useField 清除 errorMessage
+- onChange 清除 errorPaths
+- validateForm 通过后才能再次提交
+- 与普通保存体验一致
+```
+
+**示例 3：Autosave + acceptValues.overrideLocalChanges: false**
+
+```
+场景：用户正在编辑数组字段的第 2 行，同时 Autosave 在后台运行
+
+配置：
+- acceptValues: { overrideLocalChanges: false }
+- skipValidation: !validateDrafts
+
+服务端返回：
+- 第 1 行被其他用户修改
+- 用户正在编辑第 2 行
+
+状态重对齐：
+- 第 1 行 isModified = false → 接受服务端更新
+- 第 2 行 isModified = true → 保留本地值（不被覆盖）
+- 数组顺序以客户端为准（用户可能正在重新排序）
+- 服务端新增的行追加到末尾
+
+效果：
+- 用户正在编辑的值不会被后台 Autosave 打断
+- 其他用户的修改会同步过来
+- 提升多人协作体验
+```
+
+#### 自定义字段开发建议
+
+1. **草稿验证配置感知**
+   ```typescript
+   // 验证函数中可以区分提交类型
+   validate: (value, { event, req }) => {
+     // 草稿提交时，服务端仍会执行完整验证
+     // 客户端是否执行取决于 validateDrafts 配置
+     if (event === 'submit' && req?.payload?.db) {
+       // 服务端验证（始终执行）
+     }
+     return true
+   }
+   ```
+
+2. **接受服务端值的注意事项**
+   ```typescript
+   // 如果自定义字段有本地临时状态
+   // 需注意 acceptValues 配置可能覆盖这些值
+   
+   // 建议：重要的本地状态不存储在表单 state 中
+   // 使用 React state 或 useRef 存储临时状态
+   ```
+
+3. **Autosave 兼容性**
+   ```typescript
+   // 自定义字段如果依赖服务端返回的计算值
+   // 需要考虑 Autosave 可能不会覆盖本地值
+   
+   // 方案 1：在 useField 中计算
+   // 方案 2：通过 onChange 机制同步
+   ```
+
 ## 11. 结论
 
 Payload CMS 的自定义字段验证采用**"单点定义，多点执行"**的策略：
@@ -1458,4 +1791,24 @@ Payload CMS 的自定义字段验证采用**"单点定义，多点执行"**的�
 - `ADD_SERVER_ERRORS` 动作原子更新表单状态
 - `submitted` 标志控制错误 UI 的显示时机
 
-这种设计既保证了良好的用户体验（即时反馈），又确保了数据的安全性（服务端最终验证），同时通过共享验证函数避免了逻辑重复。在客户端和服务端验证结果不一致时，系统有完整的闭环机制将服务端的权威结果同步回客户端，最终达到一致性收敛。
+**恢复链路核心机制：**
+- **错误清除**：`useField` 节流验证（150ms）根据新值重新计算验证状态，通过 `UPDATE` action 覆盖旧的 `errorMessage` 和 `valid`
+- **深度清理**：`onChange` 防抖（250ms）后触发 `MERGE_SERVER_STATE`，清除 `errorPaths` 并确认 `valid = true`
+- **提交前验证**：`validateForm` 全量验证所有字段，使用 `REPLACE_STATE` 完全替换表单状态
+- **最终对齐**：提交成功后 `MERGE_SERVER_STATE (acceptValues = true)` 以服务端为权威，`setSubmitted(false)` 隐藏错误 UI
+
+**完整闭环：**
+```
+用户输入 → useField 节流验证(150ms) → UPDATE 清除错误
+           → onChange 防抖(250ms)   → MERGE_SERVER_STATE 深度清理
+           → 点击保存               → validateForm 全量验证
+           → 服务端验证成功         → MERGE_SERVER_STATE 权威对齐
+           → setSubmitted(false)   → UI 状态重置
+```
+
+这种设计既保证了良好的用户体验（即时反馈），又确保了数据的安全性（服务端最终验证），同时通过共享验证函数避免了逻辑重复。在客户端和服务端验证结果不一致时，系统有完整的闭环机制：
+1. **失败时**：服务端权威结果通过 `ADD_SERVER_ERRORS` 同步回客户端
+2. **恢复时**：用户输入触发多层验证逐步清除错误状态
+3. **成功时**：服务端权威状态通过 `MERGE_SERVER_STATE (acceptValues=true)` 覆盖客户端
+
+最终达到完全的一致性收敛。
