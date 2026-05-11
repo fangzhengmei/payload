@@ -71,8 +71,30 @@ JWT 令牌包含以下核心字段（见 `packages/payload/src/auth/getFieldsToS
 
 **JWT 签名算法**：
 - 使用 HS256（HMAC SHA-256）
-- 密钥处理：对用户配置的 secret 进行 SHA-256 哈希后取前 32 个字符
+- 密钥处理：用户配置的 `config.secret` 在 **Payload 初始化时** 进行 SHA-256 哈希后取前 32 个字符，存入 `payload.secret`。JWT 签名和验证时直接使用该已处理值，不再做额外转换
 - 令牌默认有效期：2 小时（7200 秒）
+
+**密钥处理流程**：
+
+```
+用户配置 config.secret
+       ↓
+Payload 初始化 (index.ts:844)
+       ↓
+crypto.createHash('sha256')
+  .update(config.secret)
+  .digest('hex')
+  .slice(0, 32)
+       ↓
+存储为 payload.secret (32 字符十六进制字符串)
+       ↓
+JWT 签名/验证时直接使用 TextEncoder.encode(payload.secret)
+```
+
+**关键事实**：
+- SHA-256 + 截断只发生 **一次**（初始化阶段），而非每次 JWT 操作
+- `payload.secret` 始终是 **32 字符的十六进制字符串**（等价于 16 字节二进制数据）
+- 外部服务验证 Payload JWT 时，需要对原始 secret 做相同的预处理（见 `docs/authentication/jwt.mdx`）
 
 ### 3.2 会话机制
 
