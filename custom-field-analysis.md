@@ -1773,6 +1773,424 @@ if (acceptValues === true) {
    // 方案 2：通过 onChange 机制同步
    ```
 
+### 10.12 提交参数优先级决策链
+
+当 `skipValidation`、`disableValidationOnSubmit`、`validateDrafts`、`acceptValues` 同时存在时，系统通过分层决策链确定最终行为。
+
+#### 参数分类
+
+首先需要明确这四个参数的本质区别：
+
+| 参数 | 类型 | 作用层级 | 生命周期 |
+|------|------|---------|---------|
+| **`validateDrafts`** | 集合配置 (`versions.drafts.validate`) | 集合/全局 | 文档编辑全过程 |
+| **`disableValidationOnSubmit`** | Form 组件 props | 表单实例 | 表单挂载期间 |
+| **`skipValidation`** | submit() 调用参数 | 单次提交 | 本次提交 |
+| **`acceptValues`** | submit() 调用参数 | 单次提交 | 本次提交 |
+
+**关键洞察：**
+- `validateDrafts` 是**最底层**的配置，决定了草稿模式的默认行为
+- `disableValidationOnSubmit` 是**中间层**，表单级别的开关
+- `skipValidation` 是**最上层**，单次提交的显式指令
+- `acceptValues` 是**独立维度**，不影响验证，只影响状态合并
+
+#### 按时序的判定流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      提交参数优先级决策时序                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  T1：集合配置加载 (初始化时)                                                  │
+│  ────────────────────────────                                                │
+│  - 从 docConfig 读取 versions.drafts.validate                                │
+│  - hasDraftValidationEnabled(docConfig) → validateDrafts                     │
+│  - 持久存储在 Form 组件闭包中                                                 │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  T2：Form 组件渲染 (挂载时)                                                  │
+│  ────────────────────────────                                                │
+│  - 从 props 读取 disableValidationOnSubmit                                   │
+│  - Edit 视图中：disableValidationOnSubmit = !validateBeforeSubmit           │
+│  - validateBeforeSubmit 默认为 false，仅 create 操作为 true                  │
+│  - 持久存储在 Form 组件闭包中                                                 │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  T3：点击保存/草稿/发布 (调用 submit())                                      │
+│  ─────────────────────────────────────────────                              │
+│  - 各按钮传递不同参数：                                                       │
+│    * SaveButton:     {} → 默认值                                            │
+│    * SaveDraftButton: skipValidation: true                                  │
+│    * PublishButton:   skipValidation: true                                  │
+│    * Autosave:        skipValidation: !validateDrafts                       │
+│                       acceptValues: { overrideLocalChanges: false }         │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  T4：submit() 函数执行 (核心决策点)                                          │
+│  ────────────────────────────────────                                       │
+│  第 1 步：参数默认值解构                                                     │
+│     acceptValues = true          // 显式默认                                 │
+│     skipValidation = undefined    // 无默认，由后续 OR 逻辑处理              │
+│                                                                             │
+│  第 2 步：验证跳过决策 (OR 逻辑)                                             │
+│     const isValid = skipValidation || disableValidationOnSubmit             │
+│       ? true                                                                │
+│       : await validateForm()                                                │
+│                                                                             │
+│  第 3 步：决定是否发送请求                                                   │
+│     if (!isValid) {                                                          │
+│       setSubmitted(true)   // 显示错误                                       │
+│       return                // 阻止提交                                      │
+│     }                                                                       │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  T5：服务端响应处理                                                          │
+│  ────────────────────────────                                                │
+│  第 1 步：提交类型识别                                                       │
+│     if (overrides['_status'] === 'draft') {                                 │
+│       // 判定为草稿提交                                                       │
+│       setModified(true)                                                      │
+│                                                                             │
+│       // validateDrafts 影响错误显示                                         │
+│       if (!validateDrafts) {                                                 │
+│         setSubmitted(false)  // 不显示错误                                   │
+│       }                                                                     │
+│     }                                                                       │
+│                                                                             │
+│  第 2 步：状态合并 (成功时)                                                  │
+│     dispatchFields({                                                         │
+│       type: 'MERGE_SERVER_STATE',                                            │
+│       acceptValues,        // T3 传入的参数                                  │
+│       serverState: newFormState,                                             │
+│     })                                                                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 验证跳过的决策链
+
+**核心代码：** `packages/ui/src/forms/Form/index.tsx:349-360`
+
+```typescript
+const isValid =
+  skipValidation || disableValidationOnSubmit ? true : await contextRef.current.validateForm()
+```
+
+**这是一个 OR 逻辑，优先级分析：**
+
+```
+跳过验证 = skipValidation === true  OR  disableValidationOnSubmit === true
+
+优先级关系：
+┌─────────────────────────────────────────────────────────────────┐
+│  skipValidation (undefined) → 使用 disableValidationOnSubmit   │
+│  skipValidation (true)      → 无条件跳过，优先级最高            │
+│  skipValidation (false)     → 取决于 disableValidationOnSubmit │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**各提交按钮的参数值：**
+
+| 按钮 | `skipValidation` | `disableValidationOnSubmit` (Edit 视图) | 最终结果 |
+|------|------------------|----------------------------------------|---------|
+| SaveButton (普通保存) | `undefined` | `!validateBeforeSubmit` (通常 false) | 执行验证 |
+| SaveDraftButton | `true` | `false` | **跳过验证** |
+| PublishButton | `true` | `false` | **跳过验证** |
+| Autosave | `!validateDrafts` | `false` | 取决于 `validateDrafts` |
+
+**Autosave 的特殊逻辑：** `packages/ui/src/elements/Autosave/index.tsx:164`
+
+```typescript
+const validateOnDraft = hasDraftValidationEnabled(docConfig)
+
+await submit({
+  skipValidation: !validateOnDraft,  // 动态计算
+  // ...
+})
+```
+
+| `validateDrafts` | `skipValidation` | 验证行为 |
+|------------------|------------------|---------|
+| `false` | `true` | 跳过验证 |
+| `true` | `false` | 执行验证 |
+
+#### acceptValues 的决策链
+
+**核心代码：** `packages/ui/src/forms/Form/mergeServerFormState.ts:100-129`
+
+```typescript
+let shouldAcceptValue =
+  incomingField.addedByServer ||                    // 条件 1：服务端新增字段
+  acceptValues === true ||                          // 条件 2：显式 true
+  (typeof acceptValues === 'object' &&              // 条件 3：对象配置
+    acceptValues !== null &&
+    acceptValues.overrideLocalChanges === false &&   // 显式 false，不是 null/undefined
+    !currentState[path]?.isModified)                // 且字段未修改
+```
+
+**多层判定逻辑：**
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  shouldAcceptValue 判定流程                                           │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  第 1 层：字段来源判断                                                │
+│  ─────────────────────────                                            │
+│  incomingField.addedByServer === true                                 │
+│    → 无条件接受（服务端新增的字段）                                     │
+│    → 跳过后续判断                                                      │
+│                                                                      │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  第 2 层：接受值配置判断                                              │
+│  ─────────────────────────                                            │
+│                                                                      │
+│  acceptValues === true                                               │
+│    → 无条件接受（显式保存）                                            │
+│    → 跳过后续判断                                                      │
+│                                                                      │
+│  acceptValues === undefined / null                                   │
+│    → 视为 true（因为条件 2 不满足才会到条件 3）                        │
+│    → 实际上等同于 acceptValues = true                                 │
+│                                                                      │
+│  acceptValues === { overrideLocalChanges: false }                    │
+│    → 进入条件 3 的判断                                                │
+│                                                                      │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  第 3 层：修改状态判断 (仅当 acceptValues 是对象时)                   │
+│  ──────────────────────────────────────────────────────             │
+│                                                                      │
+│  acceptValues.overrideLocalChanges === false                         │
+│  AND !currentState[path]?.isModified                                 │
+│    → 接受服务端值                                                     │
+│                                                                      │
+│  acceptValues.overrideLocalChanges === false                         │
+│  AND currentState[path]?.isModified === true                         │
+│    → 拒绝服务端值，保护本地修改                                        │
+│                                                                      │
+│  acceptValues.overrideLocalChanges !== false (undefined/null)        │
+│    → 条件 3 不满足，返回 false                                        │
+│    → 实际上等同于不接受                                                │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**注意：** `overrideLocalChanges` 必须是**显式 `false`**，`null` 或 `undefined` 不满足条件！
+
+```typescript
+// mergeServerFormState.ts:105-106
+// Note: Must be explicitly `false`, allow `null` or `undefined` to mean true
+acceptValues.overrideLocalChanges === false &&
+!currentState[path]?.isModified
+```
+
+**容易混淆的点：**
+- `acceptValues = true` → 无条件接受
+- `acceptValues = { overrideLocalChanges: false }` → 仅未修改字段接受
+- `acceptValues = { overrideLocalChanges: true }` → **不满足条件 3**，实际上不接受！
+
+#### 参数影响范围对比
+
+| 参数 | 影响时机 | 影响阶段 | 具体影响 |
+|------|---------|---------|---------|
+| `validateDrafts` | 集合配置 | Autosave 的 `skipValidation` 计算 | 决定 Autosave 是否跳过验证 |
+| | 服务端响应后 | 失败处理 | 决定草稿失败后是否保持 `submitted` |
+| `disableValidationOnSubmit` | Form props | submit() 执行前 | 表单级验证开关 |
+| `skipValidation` | submit 参数 | submit() 执行时 | 单次提交验证开关 |
+| `acceptValues` | submit 参数 | 成功后状态合并 | 决定服务端值是否覆盖本地 |
+
+#### 冲突解消表
+
+**场景 1：验证参数冲突**
+
+| `skipValidation` | `disableValidationOnSubmit` | `validateDrafts` | 最终行为 | 原因 |
+|-----------------|----------------------------|------------------|---------|------|
+| `true` | `false` | `true` | **跳过验证** | SaveDraftButton 显式指定，OR 逻辑 |
+| `true` | `true` | `true` | **跳过验证** | 任一为 true 都跳过 |
+| `false` | `true` | `true` | **跳过验证** | disableValidationOnSubmit 生效 |
+| `false` | `false` | `true` | **执行验证** | 都为 false，执行 validateForm |
+| `false` | `false` | `false` | **执行验证** | validateDrafts 不影响普通提交 |
+| `undefined` | `false` | `true` | **执行验证** | 都为 false |
+| `undefined` | `true` | `true` | **跳过验证** | disableValidationOnSubmit 生效 |
+
+**核心规则：**
+```
+最终跳过 = skipValidation === true  OR  disableValidationOnSubmit === true
+```
+
+`validateDrafts` **不直接影响**这个 OR 逻辑，它只影响：
+1. Autosave 调用 submit 时传入的 `skipValidation` 值
+2. 草稿提交失败后的 `submitted` 状态
+
+**场景 2：acceptValues 配置冲突**
+
+| `acceptValues` | `isModified` | 最终是否接受服务端值 | 说明 |
+|----------------|--------------|---------------------|------|
+| `true` | `true` | ✅ 接受 | 显式保存，无条件 |
+| `true` | `false` | ✅ 接受 | 显式保存，无条件 |
+| `undefined` | `true` | ✅ 接受 | 等同于 `true` |
+| `undefined` | `false` | ✅ 接受 | 等同于 `true` |
+| `{ overrideLocalChanges: false }` | `true` | ❌ 不接受 | 用户正在编辑，保护本地值 |
+| `{ overrideLocalChanges: false }` | `false` | ✅ 接受 | 未修改，同步服务端值 |
+| `{ overrideLocalChanges: true }` | `true` | ❌ 不接受 | 不是显式 `false`，条件 3 不满足 |
+| `{ overrideLocalChanges: null }` | `true` | ❌ 不接受 | 不是显式 `false` |
+| `{ overrideLocalChanges: undefined }` | `true` | ❌ 不接受 | 不是显式 `false` |
+
+**核心规则：**
+```
+最终接受 = 
+  addedByServer  OR                        // 服务端新增
+  acceptValues === true  OR                // 显式 true
+  (acceptValues.overrideLocalChanges === false && !isModified)  // 对象配置且未修改
+```
+
+**陷阱：** `{ overrideLocalChanges: true }` 的行为可能与直觉不符！
+
+```typescript
+// 直觉：overrideLocalChanges: true 应该覆盖本地修改
+// 实际：条件 3 要求 overrideLocalChanges === false
+//       所以 { overrideLocalChanges: true } 不满足，不接受！
+
+// 正确用法：
+acceptValues: { overrideLocalChanges: false }  // 不覆盖本地修改
+acceptValues: true                              // 覆盖本地修改（无条件）
+```
+
+**场景 3：全参数组合决策（以 Autosave 为例）**
+
+Autosave 是最复杂的场景，因为它同时使用多个参数：
+
+```typescript
+// Autosave/index.tsx:149-165
+const validateOnDraft = hasDraftValidationEnabled(docConfig)
+
+await submit({
+  acceptValues: {
+    overrideLocalChanges: false,
+  },
+  overrides: {
+    _status: 'draft',
+  },
+  skipValidation: !validateOnDraft,  // 动态计算
+})
+```
+
+**决策过程：**
+
+| 步骤 | 条件 | 结果 |
+|------|------|------|
+| 1 | 读取 `validateDrafts = versions.drafts.validate` | `true` 或 `false` |
+| 2 | 计算 `skipValidation = !validateDrafts` | 动态值 |
+| 3 | `skipValidation \|\| disableValidationOnSubmit` | 是否跳过验证 |
+| 4 | 如果不跳过，执行 `validateForm()` | 可能阻止提交 |
+| 5 | 提交到服务端，`_status = 'draft'` | 草稿模式 |
+| 6 | 服务端返回后 | |
+| 7 | `MERGE_SERVER_STATE` 合并 | |
+| 8 | `acceptValues = { overrideLocalChanges: false }` | |
+| 9 | 检查 `isModified` | 决定是否接受 |
+| 10 | 失败时检查 `validateDrafts` | 决定是否 `setSubmitted(false)` |
+
+**Autosave 完整决策示例：**
+
+```
+集合配置：versions.drafts.validate = true
+用户操作：正在编辑 username 字段（isModified = true）
+
+1. validateDrafts = true
+2. skipValidation = !true = false
+3. false || false = false → 不跳过验证
+4. validateForm() 检查客户端验证
+5. 如果通过，发送请求：_status = 'draft'
+6. 服务端返回最新状态
+7. acceptValues = { overrideLocalChanges: false }
+8. username.isModified = true
+9. 条件 3：overrideLocalChanges === false && !isModified = false
+10. 不接受服务端的 username 值（保护本地编辑）
+11. 如果服务端失败：
+    - validateDrafts = true
+    - setSubmitted(true)  // 显示错误 UI
+```
+
+#### 决策链可视化
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      完整决策链可视化                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  集合配置层                                                                  │
+│  ───────────                                                                │
+│  versions.drafts.validate                                                    │
+│       │                                                                     │
+│       ├──→ Autosave: skipValidation = !validateDrafts                      │
+│       │                                                                     │
+│       └──→ 草稿失败后: if (!validateDrafts) setSubmitted(false)             │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  表单层                                                                     │
+│  ──────                                                                     │
+│  disableValidationOnSubmit = !validateBeforeSubmit                          │
+│       │                                                                     │
+│       └──→ submit() 时: skipValidation || disableValidationOnSubmit         │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  提交层                                                                     │
+│  ──────                                                                     │
+│  submit({ skipValidation, acceptValues })                                   │
+│       │                                                                     │
+│       ├──→ 验证跳过: OR 逻辑，跳过或执行 validateForm()                     │
+│       │                                                                     │
+│       ├──→ 发送请求: _status 决定是草稿还是发布                             │
+│       │                                                                     │
+│       └──→ 状态合并: acceptValues 决定是否覆盖本地值                        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 自定义字段开发注意事项
+
+1. **不要假设验证一定会执行**
+   ```typescript
+   // 验证函数可能被跳过（草稿保存、发布操作）
+   // 服务端始终会执行 beforeValidate/beforeChange 钩子
+   // 但客户端可能跳过 validateForm()
+   
+   // 建议：关键验证放在服务端 beforeChange 钩子
+   ```
+
+2. **acceptValues 的隐式默认值**
+   ```typescript
+   // submit() 默认 acceptValues = true
+   // 但如果传递 { overrideLocalChanges: true }，实际上不会覆盖！
+   
+   // 正确：无条件覆盖
+   submit({ acceptValues: true })
+   
+   // 正确：保护本地修改
+   submit({ acceptValues: { overrideLocalChanges: false } })
+   
+   // 错误：看似要覆盖，实际不覆盖
+   submit({ acceptValues: { overrideLocalChanges: true } })  // ❌
+   ```
+
+3. **草稿失败的 silent 模式**
+   ```typescript
+   // validateDrafts = false 时
+   // 草稿保存失败不会显示错误 UI
+   // 但错误仍在 formState 中
+   
+   // 如果自定义字段需要感知草稿保存失败
+   // 需要手动检查 formState，而不仅仅依赖 submitted 状态
+   ```
+
 ## 11. 结论
 
 Payload CMS 的自定义字段验证采用**"单点定义，多点执行"**的策略：
