@@ -54,69 +54,70 @@ Live Preview 使用 `window.postMessage` 进行跨窗口通信。需要明确：
 - postMessage 由**调用方**通过 `targetOrigin` 控制，决定目标窗口是否能接收消息
 - 两者互不影响：即使 CORS 不允许跨域请求，postMessage 仍可投递消息（只要 targetOrigin 匹配）
 
-### 3.1.2 targetOrigin / serverURL 必须为纯 origin
+### 3.1.2 targetOrigin / serverURL 的 origin 处理机制
 
-#### 原因：浏览器 postMessage API 规范
+#### 规范事实：WHATWG postMessage 的 targetOrigin 处理流程
 
-根据 HTML 规范和浏览器实现，`postMessage(message, targetOrigin)` 的 `targetOrigin` 参数要求：
+根据 [WHATWG HTML 规范](https://html.spec.whatwg.org/multipage/web-messaging.html#web-messaging) 和 [MDN 文档](https://developer.mozilla.org/en-US/docs/Web/API/Window/postMessage)，`postMessage(message, targetOrigin)` 的 `targetOrigin` 参数处理流程如下：
 
-1. **`targetOrigin` 的语义**：指定"目标窗口的文档来源"必须匹配
-2. **origin 的定义**：协议 + 主机 + 端口（如 `http://localhost:3000`）
-3. **origin 不包含**：路径、查询参数、哈希等
+1. **URL Parser 解析**：浏览器将 `targetOrigin` 字符串通过 URL parser 解析
+2. **Origin 提取**：从解析结果中提取 origin（scheme + host + port）
+3. **Origin 比较**：将提取的 origin 与目标窗口的 document origin 进行**严格相等**比较
+4. **路径忽略**：路径、查询参数、哈希等在比较时会被忽略
 
-**浏览器行为**：
-- 若 `targetOrigin` 不是合法 origin（含路径），浏览器在投递时会**静默忽略**或**拒绝投递**
-- 目标窗口的 `message` 事件不会被触发
-- 不抛出异常，难以调试
+**规范示例**（WHATWG 规范中的实际代码）：
+```javascript
+var o = document.getElementsByTagName('iframe')[0];
+o.contentWindow.postMessage('Hello world', 'https://b.example.org/');
+//                                              ↑ 带路径的 targetOrigin
+// 路径 '/' 会被忽略，实际比较的 origin 是 'https://b.example.org'
+```
 
-#### 错误 vs 正确
+**origin 的定义**：
+- 协议（scheme）：`http` / `https` / `file` 等
+- 主机（host）：域名或 IP 地址
+- 端口（port）：显式指定或默认端口
 
-| 用法 | 值 | 结果 |
+**origin 不包含**：路径、查询参数、哈希、用户名、密码
+
+#### 规范事实 vs 风险提示
+
+| 分类 | 内容 | 来源 |
 |-----|-----|-----|
-| ❌ 错误 | `http://localhost:3000/preview` | 含路径，投递失败 |
-| ❌ 错误 | `http://localhost:3000/posts/123` | 含路径，投递失败 |
-| ✅ 正确 | `http://localhost:3000` | 纯 origin，投递成功 |
-| ✅ 正确 | `https://admin.example.com` | 纯 origin，投递成功 |
-| ✅ 正确 | `"*"` | 通配符（不推荐，安全风险） |
+| **规范事实** | `targetOrigin` 可以是完整 URI（含路径） | WHATWG HTML 规范 |
+| **规范事实** | 浏览器会通过 URL parser 解析后提取 origin 比较 | WHATWG HTML 规范 |
+| **规范事实** | 路径在比较时会被忽略 | WHATWG HTML 规范 |
+| **规范事实** | 只有 scheme + host + port 不匹配时，消息才会被丢弃 | WHATWG HTML 规范 |
+| **风险提示** | `event.origin` 始终是纯 origin（不含路径） | MDN 文档 |
+| **风险提示** | 接收端使用 `event.origin === serverURL` 校验时，若 `serverURL` 含路径会导致校验失败 | 代码分析 |
 
-#### 异常表现：两条失败路径
+#### 风险分析：一条风险路径（不是两条）
 
-**路径 1：投递阶段失败（targetOrigin 含路径）**
+根据规范事实，`targetOrigin` 带路径**不会导致投递失败**。实际存在的风险只有一条：
 
-```
-后台管理端 (Admin)                    前端预览端 (Frontend)
-        |                                     |
-        |  postMessage(                       |
-        |    { type: 'payload-live-preview' },|
-        |    'http://localhost:3000/preview'  |
-        |        ↑ 含路径                      |
-        |  )                                  |
-        |----|                                |
-             |
-             ▼
-    浏览器静默拒绝投递
-    目标窗口 message 事件不触发
-    无任何异常抛出
-```
-
-**路径 2：接收校验失败（serverURL 含路径）**
+**风险：接收端 origin 校验失败（serverURL 含路径）**
 
 ```
-假设消息投递成功（targetOrigin 正确），但 serverURL 配置含路径：
-
 后台管理端                          前端预览端
         |                                 |
         |  postMessage(                   |
         |    { type: 'payload-live-preview' },|
-        |    'http://localhost:3000'     |  ✅ targetOrigin 正确
+        |    'http://localhost:3000/preview'  |
+        |         ↑ 带路径的 targetOrigin      |
         |  )                              |
         |------------------------------->|
                                           |
-                                          |  event.origin = 'http://localhost:3000'
+                                          |  规范事实：
+                                          |  浏览器 URL parser 解析
+                                          |  提取 origin = 'http://localhost:3000'
+                                          |  路径 '/preview' 被忽略
+                                          |  ✅ 消息投递成功
                                           |
-                                          |  isLivePreviewEvent(event, serverURL)
+                                          |  风险点：
+                                          |  event.origin = 'http://localhost:3000'
                                           |  serverURL = 'http://localhost:3000/preview'
                                           |
+                                          |  isLivePreviewEvent(event, serverURL)
                                           |  校验逻辑：
                                           |  event.origin === serverURL
                                           |  'http://localhost:3000' === 'http://localhost:3000/preview'
@@ -125,14 +126,16 @@ Live Preview 使用 `window.postMessage` 进行跨窗口通信。需要明确：
                                           |  结果：消息被忽略，不触发更新
 ```
 
-#### 代码中的实际问题
+#### 代码中的实际风险点
 
 | 使用位置 | 代码文件 | 变量 | 可能含路径 | 风险类型 |
 |---------|---------|-----|-----------|---------|
-| 后台发送数据 | `packages/ui/src/elements/LivePreview/Window/index.tsx:72,77,112,117` | `url` | ✅ 预览页面 URL 可能含路径 | **路径 1：投递失败** |
-| 前端发送 ready | `packages/live-preview/src/ready.ts:15` | `serverURL` | 取决于用户配置 | **路径 1：投递失败** |
-| 前端校验 | `packages/live-preview/src/isLivePreviewEvent.ts:2` | `serverURL` | 取决于用户配置 | **路径 2：校验失败** |
-| 前端校验 | `packages/live-preview/src/isDocumentEvent.ts:2` | `serverURL` | 取决于用户配置 | **路径 2：校验失败** |
+| 前端校验（表单数据） | `packages/live-preview/src/isLivePreviewEvent.ts:2` | `serverURL` | 取决于用户配置 | **origin 校验失败** |
+| 前端校验（文档事件） | `packages/live-preview/src/isDocumentEvent.ts:2` | `serverURL` | 取决于用户配置 | **origin 校验失败** |
+
+**注意**：
+- 后台发送数据使用的 `url`（`packages/ui/src/elements/LivePreview/Window/index.tsx:72,77,112,117`）：根据 WHATWG 规范，即使含路径也不会导致投递失败，浏览器会自动提取 origin 进行比较
+- 前端发送 ready 使用的 `serverURL`（`packages/live-preview/src/ready.ts:15`）：同上，含路径不会导致投递失败
 
 ### 3.2 消息格式
 
@@ -673,6 +676,7 @@ export default async function Page({ params }) {
          │                                                     │  2. subscribe()
          │                                                     │  3. resetCache()
          │                                                     │  4. ready({ serverURL })
+         │                                                     │     ⚠️ serverURL 必须是纯 origin
          │  { type: 'payload-live-preview', ready: true }      │
          │<────────────────────────────────────────────────────│
          │                                                     │
@@ -686,10 +690,25 @@ export default async function Page({ params }) {
          │  9. postMessage({                                   │
          │       type: 'payload-live-preview',                 │
          │       data: values,                                 │
-         │       collectionSlug, ...                           │
+         │       collectionSlug,                               │
+         │       externallyUpdatedRelationship: mostRecentUpdate, │
+         │                         ↑ 已发送但接收端未消费        │
          │     })                                              │
+         │     ⚠️ targetOrigin=url 可能含路径 → 投递失败        │
          │────────────────────────────────────────────────────>│
-         │                                                     │  10. event.origin === serverURL 校验
+         │                                                     │
+         │  路径 1（投递失败）：url 含路径                       │
+         │  → 浏览器静默拒绝投递                                │
+         │  → 无异常，难以调试                                  │
+         │                                                     │
+         │  路径 2（校验失败）：serverURL 含路径                 │
+         │                                                     │  10. event.origin = 'http://localhost:3000'
+         │                                                     │      serverURL = 'http://localhost:3000/preview'
+         │                                                     │      event.origin === serverURL → false ❌
+         │                                                     │  → 消息被忽略
+         │                                                     │
+         │  路径 3（正常流程）：都是纯 origin                   │
+         │                                                     │  10. event.origin === serverURL 校验 ✅
          │                                                     │  11. mergeData() → API 调用
          │                                                     │  12. _payloadLivePreview.previousData = result
          │                                                     │  13. callback(mergedData)
@@ -701,6 +720,7 @@ export default async function Page({ params }) {
          │  16. postMessage({                                  │
          │        type: 'payload-document-event'               │
          │      })                                             │
+         │     ⚠️ targetOrigin=url 可能含路径 → 投递失败        │
          │────────────────────────────────────────────────────>│
          │                                                     │  17. event.origin === serverURL 校验
          │                                                     │  18. refresh()
@@ -709,4 +729,49 @@ export default async function Page({ params }) {
          │                                                     │  21. 页面重新渲染
          │                                                     │
          │  (两种同步模式独立运行，互不干扰)                      │
+```
+
+### 10.5 失败路径时序图
+
+#### 路径 1：targetOrigin 含路径 → 投递阶段失败
+
+```
+后台管理端 (Admin)                          前端预览端 (Frontend)
+        |                                       |
+        |  postMessage(                        |
+        |    { type: 'payload-live-preview' }, |
+        |    'http://localhost:3000/preview'   |
+        |         ↑ 含路径                      |
+        |  )                                   |
+        |----|                                 |
+             |
+             ▼
+      浏览器静默拒绝投递
+      目标窗口 message 事件不触发
+      无任何异常抛出
+      → 前端无任何反应
+```
+
+#### 路径 2：serverURL 含路径 → 校验阶段失败
+
+```
+假设消息投递成功，但 serverURL 配置含路径：
+
+后台管理端                          前端预览端
+        |                                 |
+        |  postMessage(                   |
+        |    { type: 'payload-live-preview' },|
+        |    'http://localhost:3000'     |  ✅ targetOrigin 正确
+        |  )                              |
+        |------------------------------->|
+                                          |
+                                          |  event.origin = 'http://localhost:3000'
+                                          |  serverURL = 'http://localhost:3000/preview'
+                                          |
+                                          |  isLivePreviewEvent(event, serverURL)
+                                          |  'http://localhost:3000' === 'http://localhost:3000/preview'
+                                          |  → false ❌
+                                          |
+                                          |  结果：消息被忽略，不触发更新
+                                          |  → 前端无任何反应
 ```
