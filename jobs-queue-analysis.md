@@ -641,6 +641,457 @@ schedule: [{
 }]
 ```
 
+#### 1.3.8 隐性风险一：stats 快照回写导致的相互覆盖
+
+**问题描述**：
+
+`handleSchedules` 在开始时读取一次 `stats` 快照，然后在循环中为每个调度项调用 `defaultAfterSchedule`。每个 `defaultAfterSchedule` 都使用这份**启动时的快照**进行回写，导致多个调度项之间相互覆盖。
+
+**代码证据**：
+
+```typescript
+// packages/payload/src/queues/operations/handleSchedules/index.ts:60-117
+export async function handleSchedules(...) {
+  // 1. 开始时只读取一次 stats 快照
+  const stats: JobStats = await req.payload.db.findGlobal({
+    slug: jobStatsGlobalSlug,
+    req,
+  })
+
+  // 2. 收集所有可调度项
+  const queueables: Queueable[] = []
+  for (const [queueName, { schedules }] of Object.entries(queuesWithSchedules)) {
+    for (const schedulable of schedules) {
+      const queuable = checkQueueableTimeConstraints({
+        queue: queueName,
+        scheduleConfig: schedulable.scheduleConfig,
+        stats,  // ← 使用同一份快照
+        ...
+      })
+      if (queuable) queueables.push(queuable)
+    }
+  }
+
+  // 3. 循环处理每个调度项（串行执行）
+  for (const queueable of queueables) {
+    const { status } = await scheduleQueueable({
+      queueable,
+      req,
+      stats,  // ← 每个都使用同一份快照
+    })
+  }
+}
+```
+
+```typescript
+// packages/payload/src/queues/operations/handleSchedules/defaultAfterSchedule.ts:10-65
+export const defaultAfterSchedule: AfterScheduleFn = async ({ jobStats, queueable, req }) => {
+  // jobStats 是 handleSchedules 开始时读取的快照
+  // 不是当前数据库的最新状态！
+  
+  const existingQueuesConfig =
+    jobStats?.stats?.scheduledRuns?.queues?.[queueable.scheduleConfig.queue] || {}
+
+  const queueConfig: JobStatsScheduledRuns = {
+    ...existingQueuesConfig,  // ← 基于旧快照展开
+  }
+  
+  // 更新当前任务的 lastScheduledRun...
+  
+  // 基于旧快照回写整个对象
+  if (jobStats) {
+    await req.payload.db.updateGlobal({
+      slug: jobStatsGlobalSlug,
+      data: {
+        ...(jobStats || {}),  // ← 使用启动时的快照
+        stats: {
+          ...(jobStats?.stats || {}),  // ← 也是旧快照
+          scheduledRuns: {
+            ...(jobStats?.stats?.scheduledRuns || {}),  // ← 旧快照
+            queues: {
+              ...(jobStats?.stats?.scheduledRuns?.queues || {}),  // ← 旧快照
+              [queueable.scheduleConfig.queue]: queueConfig,  // ← 只更新了当前 queue
+            },
+          },
+        },
+        updatedAt: getCurrentDate().toISOString(),
+      },
+      req,
+      returning: false,
+    })
+  }
+}
+```
+
+**时序影响**：
+
+假设同一队列 `default` 有两个任务 `taskA` 和 `taskB`，初始状态：
+```
+stats: {
+  scheduledRuns: {
+    queues: {
+      default: {
+        tasks: {
+          taskA: { lastScheduledRun: '08:00' },
+          taskB: { lastScheduledRun: '08:00' },
+        }
+      }
+    }
+  }
+}
+```
+
+```
+时间线（同一 handleSchedules 调用内）：
+
+T0: handleSchedules 读取 stats 快照 S0
+    S0 = { taskA: 08:00, taskB: 08:00 }
+
+T1: 处理 taskA
+    → scheduleQueueable({ stats: S0 })
+    → beforeSchedule 通过
+    → 入队成功
+    → defaultAfterSchedule({ jobStats: S0 })
+      → existingQueuesConfig = S0.queues.default
+        = { taskA: 08:00, taskB: 08:00 }
+      → 更新 taskA.lastScheduledRun = 08:30
+      → 回写：{ taskA: 08:30, taskB: 08:00 } ← 数据库更新 ✅
+
+T2: 处理 taskB
+    → scheduleQueueable({ stats: S0 })  ← 仍然使用 S0！
+    → beforeSchedule 通过
+    → 入队成功
+    → defaultAfterSchedule({ jobStats: S0 })
+      → existingQueuesConfig = S0.queues.default
+        = { taskA: 08:00, taskB: 08:00 }  ← 还是旧值！
+      → 更新 taskB.lastScheduledRun = 08:30
+      → 回写：{ taskA: 08:00, taskB: 08:30 } ← 覆盖了 T1 的更新！❌
+
+最终数据库状态：
+taskA: 08:00（被覆盖丢失）
+taskB: 08:30
+```
+
+**实际影响**：
+
+| 场景 | 影响 |
+|------|------|
+| **同队列多个调度项** | 只有最后一个的 `lastScheduledRun` 会被正确保存 |
+| **多队列场景** | 不同队列的更新也可能相互覆盖 |
+| **下次调度计算** | 被覆盖的任务会基于旧的 `lastScheduledRun` 计算，可能重复入队或漏跑 |
+| **并发 handleSchedules** | 多实例环境下问题更严重 |
+
+**修正建议**：
+
+```typescript
+// 方案 1：在 defaultAfterSchedule 中重新读取最新 stats（推荐）
+const fixedAfterSchedule: AfterScheduleFn = async ({ queueable, req }) => {
+  // 每次都从数据库读取最新状态，而不是使用传入的旧快照
+  const currentStats = await req.payload.db.findGlobal({
+    slug: 'payload-jobs-stats',
+    req,
+  })
+
+  const existingQueuesConfig =
+    currentStats?.stats?.scheduledRuns?.queues?.[queueable.scheduleConfig.queue] || {}
+
+  const queueConfig: JobStatsScheduledRuns = {
+    ...existingQueuesConfig,
+  }
+  
+  if (queueable.taskConfig) {
+    ;(queueConfig.tasks ??= {})[queueable.taskConfig.slug] = {
+      lastScheduledRun: getCurrentDate().toISOString(),
+    }
+  }
+
+  // 使用读取到的 currentStats 回写
+  if (currentStats) {
+    await req.payload.db.updateGlobal({
+      slug: 'payload-jobs-stats',
+      data: {
+        ...currentStats,  // 使用最新读取的
+        stats: {
+          ...currentStats?.stats,
+          scheduledRuns: {
+            ...currentStats?.stats?.scheduledRuns,
+            queues: {
+              ...currentStats?.stats?.scheduledRuns?.queues,
+              [queueable.scheduleConfig.queue]: queueConfig,
+            },
+          },
+        },
+      },
+      req,
+    })
+  }
+}
+
+// 方案 2：串行处理并在每次更新后刷新内存中的 stats（在 handleSchedules 层面）
+// 需要修改 handleSchedules 的核心逻辑，不推荐
+```
+
+#### 1.3.9 隐性风险二：同一 slug 多条 schedule 无法区分进度
+
+**问题描述**：
+
+`TaskConfig.schedule` 和 `WorkflowConfig.schedule` 都是数组，允许同一任务配置多条不同的 cron 调度。但 `scheduledRuns` 的存储结构只按 `queue + task/workflow slug` 记录，无法区分同 slug 下的多条 schedule。
+
+**代码证据**：
+
+```typescript
+// packages/payload/src/queues/config/types/taskTypes.ts:253
+schedule?: ScheduleConfig[]  // 数组，允许多条 schedule
+
+// packages/payload/src/queues/config/types/workflowTypes.ts:219
+schedule?: ScheduleConfig[]  // 数组，允许多条 schedule
+```
+
+```typescript
+// packages/payload/src/queues/config/global.ts:11-30
+export type JobStats = {
+  stats?: {
+    scheduledRuns?: {
+      queues?: {
+        [queueSlug: string]: {
+          tasks?: {
+            [taskSlug: string]: {         // ← 只按 taskSlug 索引
+              lastScheduledRun: string     // ← 没有区分多条 schedule
+            }
+          }
+          workflows?: {
+            [workflowSlug: string]: {     // ← 只按 workflowSlug 索引
+              lastScheduledRun: string     // ← 没有区分多条 schedule
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+```typescript
+// packages/payload/src/queues/operations/handleSchedules/index.ts:125-155
+export function checkQueueableTimeConstraints({
+  queue, scheduleConfig, stats, taskConfig, workflowConfig
+}): false | Queueable {
+  const queueScheduleStats = stats?.stats?.scheduledRuns?.queues?.[queue]
+
+  // 只按 slug 查找，不区分具体是哪条 schedule
+  const lastScheduledRun = taskConfig
+    ? queueScheduleStats?.tasks?.[taskConfig.slug]?.lastScheduledRun
+    : queueScheduleStats?.workflows?.[workflowConfig?.slug ?? '']?.lastScheduledRun
+
+  // 所有 schedule 共享同一个 lastScheduledRun
+  const nextRun = new Cron(scheduleConfig.cron).nextRun(lastScheduledRun ?? undefined)
+
+  if (!nextRun) return false
+
+  return {
+    scheduleConfig,
+    taskConfig,
+    waitUntil: nextRun,
+    workflowConfig,
+  }
+}
+```
+
+```typescript
+// packages/payload/src/queues/operations/handleSchedules/defaultAfterSchedule.ts:10-25
+export const defaultAfterSchedule: AfterScheduleFn = async ({ jobStats, queueable, req }) => {
+  // 只按 slug 写入，不区分具体的 schedule
+  if (queueable.taskConfig) {
+    ;(queueConfig.tasks ??= {})[queueable.taskConfig.slug] = {
+      lastScheduledRun: getCurrentDate().toISOString(),  // 覆盖同 slug 的所有 schedule
+    }
+  } else if (queueable.workflowConfig) {
+    ;(queueConfig.workflows ??= {})[queueable.workflowConfig.slug] = {
+      lastScheduledRun: getCurrentDate().toISOString(),  // 覆盖同 slug 的所有 schedule
+    }
+  }
+}
+```
+
+**时序影响**：
+
+假设配置如下：
+```typescript
+jobs: {
+  tasks: [{
+    slug: 'reportTask',
+    schedule: [
+      { cron: '0 8 * * *', queue: 'daily' },    // schedule #1: 每天 8:00
+      { cron: '0 20 * * *', queue: 'daily' },   // schedule #2: 每天 20:00
+    ],
+    handler: ...
+  }]
+}
+```
+
+初始状态：`reportTask` 无任何调度记录
+
+```
+时间线：
+
+第一天：
+T1: 08:00 - handleSchedules 触发
+    → 检查 schedule #1 (8:00)
+      → lastScheduledRun = undefined
+      → nextRun = Cron('0 8 * * *').nextRun(undefined) = 今天 8:00（过去时间）
+      → 应该触发
+    → 检查 schedule #2 (20:00)
+      → lastScheduledRun = undefined
+      → nextRun = Cron('0 20 * * *').nextRun(undefined) = 今天 20:00（未来）
+      → 不触发
+    → 只处理 schedule #1
+    → 入队成功
+    → 回写：reportTask.lastScheduledRun = '今天 08:00'
+
+T2: 20:00 - handleSchedules 触发
+    → 检查 schedule #1 (8:00)
+      → lastScheduledRun = '今天 08:00'
+      → nextRun = Cron('0 8 * * *').nextRun('今天 08:00') = 明天 08:00（未来）
+      → 不触发
+    → 检查 schedule #2 (20:00)
+      → lastScheduledRun = '今天 08:00'  ← 使用的是同一条记录！
+      → nextRun = Cron('0 20 * * *').nextRun('今天 08:00') = 今天 20:00（现在）
+      → 应该触发
+    → 处理 schedule #2
+    → 入队成功
+    → 回写：reportTask.lastScheduledRun = '今天 20:00'  ← 覆盖了 schedule #1 的记录
+
+第二天：
+T3: 08:00 - handleSchedules 触发
+    → 检查 schedule #1 (8:00)
+      → lastScheduledRun = '今天 20:00'  ← 是 schedule #2 写入的！
+      → nextRun = Cron('0 8 * * *').nextRun('昨天 20:00') = 今天 08:00（现在）
+      → 应该触发 ✓
+    → 检查 schedule #2 (20:00)
+      → lastScheduledRun = '昨天 20:00'
+      → nextRun = Cron('0 20 * * *').nextRun('昨天 20:00') = 今天 20:00（未来）
+      → 不触发
+```
+
+**看似正常，但实际风险场景**：
+
+```
+场景：系统停机一段时间后恢复
+
+假设配置：
+schedule #1: 每 10 分钟 (*/10 * * * *)
+schedule #2: 每 30 分钟 (*/30 * * * *)
+
+停机前最后一次调度：
+- schedule #1 最后运行：10:00
+- schedule #2 最后运行：10:00
+
+系统停机：10:10 - 11:20（1 小时 10 分钟）
+
+恢复时（11:20）：
+lastScheduledRun = 10:00（是 schedule #2 在 10:00 写入的）
+
+检查：
+schedule #1 (*/10):
+  nextRun = Cron('*/10').nextRun(10:00) = 10:10（过去）
+  → 触发一次（补跑最近一次）
+  → 回写：lastScheduledRun = 11:20
+
+schedule #2 (*/30):
+  nextRun = Cron('*/30').nextRun(11:20)  ← 用的是 schedule #1 刚写入的！
+          = 11:30（未来）
+  → 不触发！
+
+问题：
+- schedule #2 在 10:30、11:00 本该运行的两次都被跳过
+- 因为 lastScheduledRun 被 schedule #1 推到了 11:20
+```
+
+**实际影响**：
+
+| 场景 | 影响 |
+|------|------|
+| **正常运行** | 看起来正常，因为各 schedule 的 nextRun 计算相对独立 |
+| **系统停机恢复** | 多条 schedule 共享一个 `lastScheduledRun`，可能导致部分补跑被跳过 |
+| **不同频率的 schedule** | 高频 schedule 会不断刷新 `lastScheduledRun`，低频 schedule 的进度被覆盖 |
+| **不同队列的同 slug** | 不同队列的同 slug schedule 共享一条记录，互相干扰 |
+
+**修正建议**：
+
+```typescript
+// 方案：扩展存储结构，按 cron 表达式区分多条 schedule
+
+// 新的 JobStats 结构（建议）
+type FixedJobStats = {
+  stats?: {
+    scheduledRuns?: {
+      queues?: {
+        [queueSlug: string]: {
+          tasks?: {
+            [taskSlug: string]: {
+              // 按 cron 表达式区分多条 schedule
+              schedules?: {
+                [cronExpr: string]: {
+                  lastScheduledRun: string
+                }
+              }
+            }
+          }
+          workflows?: {
+            [workflowSlug: string]: {
+              schedules?: {
+                [cronExpr: string]: {
+                  lastScheduledRun: string
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// 自定义 checkQueueableTimeConstraints
+function fixedCheckQueueableTimeConstraints({
+  queue, scheduleConfig, stats, taskConfig, workflowConfig
+}) {
+  const queueScheduleStats = stats?.stats?.scheduledRuns?.queues?.[queue]
+  
+  // 按 cron 表达式查找具体的 schedule 进度
+  const cronExpr = scheduleConfig.cron
+  
+  let lastScheduledRun
+  if (taskConfig) {
+    lastScheduledRun = queueScheduleStats?.tasks?.[taskConfig.slug]
+      ?.schedules?.[cronExpr]?.lastScheduledRun
+  } else {
+    lastScheduledRun = queueScheduleStats?.workflows?.[workflowConfig?.slug ?? '']
+      ?.schedules?.[cronExpr]?.lastScheduledRun
+  }
+
+  const nextRun = new Cron(cronExpr).nextRun(lastScheduledRun ?? undefined)
+  // ...
+}
+
+// 临时兼容方案（不修改 Payload 源码）：
+// 避免在同一任务中配置多条 schedule，改用多个独立任务
+jobs: {
+  tasks: [
+    {
+      slug: 'reportTaskMorning',  // 拆分为独立任务
+      schedule: [{ cron: '0 8 * * *', queue: 'daily' }],
+      handler: reportTaskHandler,
+    },
+    {
+      slug: 'reportTaskEvening',  // 拆分为独立任务
+      schedule: [{ cron: '0 20 * * *', queue: 'daily' }],
+      handler: reportTaskHandler,  // 复用相同的 handler
+    },
+  ]
+}
+```
+
 ### 1.4 任务执行调度机制
 
 任务执行通过四种方式实现：
