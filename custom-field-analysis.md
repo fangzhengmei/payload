@@ -418,7 +418,433 @@ const customField: Field = {
 | 类型验证函数库 | `packages/payload/src/fields/validations.ts` |
 | JSON Schema 生成 | `packages/payload/src/utilities/configToJSONSchema.ts` |
 
-## 9. 结论
+## 9. 提交失败时的一致性收敛机制
+
+当客户端校验通过但提交阶段失败时，Payload CMS 有完整的闭环机制将服务端错误同步回客户端表单状态，确保两侧一致性收敛。
+
+### 9.1 完整闭环流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   提交失败一致性收敛闭环                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  阶段 1：服务端错误判定与收集                                            │
+│  ─────────────────────────────                                          │
+│  位置：beforeChange/promise.ts:202-264                                   │
+│  - 遍历所有字段执行 validate 函数                                        │
+│  - 收集 ValidationFieldError: { path, message, label? }                  │
+│  - 支持嵌套字段路径 (如 "blocks.0.title")                                │
+│  - 支持 blocks filterOptions 错误展开                                    │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  阶段 2：错误包装为 HTTP 响应                                            │
+│  ─────────────────────────────                                          │
+│  位置：errors/ValidationError.ts:21-78                                   │
+│  - ValidationError extends APIError                                     │
+│  - HTTP 状态码：400 BAD_REQUEST                                          │
+│  - 响应体：{ collection?, global?, errors: ValidationFieldError[] }      │
+│  - label 函数在错误构造时执行 (使用 req.i18n)                            │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  阶段 3：客户端接收与解析错误                                            │
+│  ─────────────────────────────                                          │
+│  位置：ui/src/forms/Form/index.tsx:456-517                               │
+│  - res.status >= 400 判定为失败                                          │
+│  - 解析 JSON 响应                                                        │
+│  - 分离 fieldErrors (有 path) 和 nonFieldErrors                          │
+│  - 错误分类逻辑：                                                        │
+│    - err.data?.errors 中每个元素                                         │
+│    - 有 path → fieldErrors                                              │
+│    - 无 path → nonFieldErrors                                           │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  阶段 4：表单状态更新                                                    │
+│  ─────────────────────────────                                          │
+│  位置：ui/src/forms/Form/fieldReducer.ts:72-132                          │
+│  - Action: 'ADD_SERVER_ERRORS'                                          │
+│  - 为每个错误路径更新字段状态：                                           │
+│    - valid: false                                                        │
+│    - errorMessage: message                                               │
+│  - 递归更新父级 errorPaths（用于聚合显示）                                │
+│    - 如 "blocks.0.title" 错误 → "blocks.0" 和 "blocks" 的 errorPaths     │
+│      都包含该路径                                                        │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  阶段 5：UI 显示错误                                                     │
+│  ─────────────────────────────                                          │
+│  位置：ui/src/forms/useField/index.tsx:62                                │
+│  - showError = valid === false && submitted                              │
+│  - 表单进入 submitted 状态后显示错误                                     │
+│  - 组件通过 useField 获取 errorMessage 和 errorPaths                     │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.2 关键代码路径
+
+#### 9.2.1 服务端错误收集
+
+**位置：** `packages/payload/src/fields/hooks/beforeChange/promise.ts:202-264`
+
+```typescript
+// 服务端验证失败收集
+if (typeof validationResult === 'string') {
+  let filterOptionsError = false
+  
+  // blocks 字段特殊处理：展开每个无效 block 的错误
+  if (field.type === 'blocks' && field.filterOptions) {
+    const validationResult = await validateBlocksFilterOptions({...})
+    if (validationResult?.invalidBlockSlugs?.length) {
+      // 为每个无效 block 单独生成错误
+      for (const block of siblingData[field.name] as JsonObject[]) {
+        if (validationResult.invalidBlockSlugs.includes(block.blockType as string)) {
+          errors.push({
+            label: blockLabelPath,
+            message: req.t('validation:invalidBlock', { block: block.blockType }),
+            path: `${path}.${rowIndex}.id`,  // 嵌套路径
+          })
+        }
+      }
+    }
+  }
+  
+  // 普通字段错误
+  if (!filterOptionsError) {
+    errors.push({
+      label: fieldLabel,
+      message: validationResult,  // 验证函数返回的错误消息
+      path,                        // 字段完整路径
+    })
+  }
+}
+```
+
+#### 9.2.2 客户端错误解析与状态更新
+
+**位置：** `packages/ui/src/forms/Form/index.tsx:478-517`
+
+```typescript
+// 解析服务端返回的错误
+if (Array.isArray(json.errors)) {
+  const [fieldErrors, nonFieldErrors] = json.errors.reduce(
+    ([fieldErrs, nonFieldErrs], err) => {
+      // 分类：有 path 是字段错误，否则是非字段错误
+      if (err?.data?.errors) {
+        err.data.errors.forEach((dataError) => {
+          if (dataError?.path) {
+            newFieldErrs.push(dataError)  // → fieldErrors
+          } else {
+            newNonFieldErrs.push(dataError)  // → nonFieldErrors
+          }
+        })
+      }
+      return [[...fieldErrs, ...newFieldErrs], [...nonFieldErrs, ...newNonFieldErrs]]
+    },
+    [[], []]
+  )
+  
+  // 更新表单状态
+  dispatchFields({
+    type: 'ADD_SERVER_ERRORS',
+    errors: fieldErrors,  // 传入 reducer
+  })
+  
+  // 非字段错误显示为 toast
+  nonFieldErrors.forEach((err) => {
+    errorToast(<FieldErrorsToast errorMessage={err.message} />)
+  })
+}
+```
+
+#### 9.2.3 表单状态更新逻辑
+
+**位置：** `packages/ui/src/forms/Form/fieldReducer.ts:72-132`
+
+```typescript
+case 'ADD_SERVER_ERRORS': {
+  let newState = { ...state }
+  
+  // 1. 为每个错误路径设置字段状态
+  action.errors.forEach(({ message, path: fieldPath }) => {
+    newState[fieldPath] = {
+      ...(newState[fieldPath] || {
+        initialValue: null,
+        value: null,
+      }),
+      errorMessage: message,  // 错误消息
+      valid: false,            // 标记为无效
+    }
+    
+    // 收集父级路径（用于 errorPaths）
+    const segments = fieldPath.split('.')
+    if (segments.length > 1) {
+      errorPaths.push({
+        fieldErrorPath: fieldPath,
+        parentPath: segments.slice(0, segments.length - 1).join('.'),
+      })
+    }
+  })
+  
+  // 2. 递归更新父级字段的 errorPaths
+  // 例如 "blocks.0.title" 错误要反映在 "blocks.0" 和 "blocks" 上
+  newState = Object.entries(newState).reduce((acc, [path, fieldState]) => {
+    const fieldErrorPaths = errorPaths.reduce((errorACC, { fieldErrorPath, parentPath }) => {
+      if (parentPath.startsWith(path)) {
+        errorACC.push(fieldErrorPath)
+      }
+      return errorACC
+    }, [])
+    
+    if (fieldErrorPaths.length > 0) {
+      acc[path] = {
+        ...fieldState,
+        errorPaths: [...(fieldState.errorPaths || []), ...fieldErrorPaths],
+      }
+    }
+    return acc
+  }, {})
+  
+  return newState
+}
+```
+
+### 9.3 状态标志更新
+
+除了字段状态，表单还会更新以下全局状态：
+
+```typescript
+// Form/index.tsx:457-469
+setProcessing(false)   // 结束处理状态
+setSubmitted(true)     // 标记为已提交（触发 UI 显示错误）
+
+// 草稿提交失败特殊处理
+if (overridesFromArgs['_status'] === 'draft') {
+  setModified(true)     // 保持修改状态，允许重试
+  if (!validateDrafts) {
+    setSubmitted(false) // 草稿不显示验证错误
+  }
+}
+
+setIsValid(false)       // 全局标记为无效
+contextRef.current = { ...contextRef.current }  // 触发订阅组件重渲染
+```
+
+### 9.4 典型失配场景与分析
+
+#### 场景 1：数据库唯一性检查失配
+
+**问题描述：**
+- 客户端验证通过（格式检查、长度限制等）
+- 服务端提交时发现数据库中已存在相同值（唯一性约束）
+- 这种检查无法在客户端执行，因为需要数据库查询
+
+**字段配置示例：**
+
+```typescript
+// 自定义用户名字段
+const usernameField: TextField = {
+  name: 'username',
+  type: 'text',
+  required: true,
+  unique: true,  // 数据库层面唯一约束
+  
+  validate: async (value, options) => {
+    const { event, req, collectionSlug, id } = options
+    
+    // 1. 基础格式验证 - 客户端和服务端都执行
+    if (!value || value.length < 3) {
+      return '用户名至少需要 3 个字符'
+    }
+    
+    if (!/^[a-zA-Z0-9_]+$/.test(value)) {
+      return '用户名只能包含字母、数字和下划线'
+    }
+    
+    // 2. 唯一性检查 - 仅在服务端提交时执行
+    //    客户端无法访问数据库，这个检查会被跳过
+    if (event === 'submit' && req?.payload?.db) {
+      const existingDocs = await req.payload.find({
+        collection: collectionSlug!,
+        where: {
+          username: { equals: value },
+          ...(id ? { id: { not_equals: id } } : {}), // 排除自身
+        },
+        limit: 1,
+      })
+      
+      if (existingDocs.docs.length > 0) {
+        return '该用户名已被使用，请选择另一个'
+      }
+    }
+    
+    return true
+  }
+}
+```
+
+**失配流程：**
+1. 用户输入 `admin123`
+2. 客户端 `useField` 验证：
+   - `event = 'onChange'`
+   - 跳过数据库查询分支
+   - 格式检查通过 → `valid: true`
+3. 用户点击保存
+4. 服务端 `beforeChange` 验证：
+   - `event = 'submit'`
+   - 执行数据库查询
+   - 发现已存在 → 返回错误消息
+5. 服务端返回 400 响应：
+   ```json
+   {
+     "errors": [{
+       "data": {
+         "errors": [{
+           "message": "该用户名已被使用，请选择另一个",
+           "path": "username"
+         }]
+       }
+     }]
+   }
+   ```
+6. 客户端 `ADD_SERVER_ERRORS` 动作：
+   - `username` 字段 `valid: false`
+   - `errorMessage: '该用户名已被使用，请选择另一个'`
+   - `submitted: true` 触发 UI 显示
+
+**关键设计：**
+- 验证函数通过 `event === 'submit'` 隔离数据库查询
+- 错误通过 `path` 精确映射到对应字段
+- 错误消息在服务端构造（支持 i18n），客户端直接显示
+
+#### 场景 2：跨字段业务规则验证失配
+
+**问题描述：**
+- 单个字段验证通过
+- 但字段之间的组合关系不符合业务规则
+- 这种验证依赖完整的表单数据和上下文
+
+**字段配置示例：**
+
+```typescript
+// 优惠码系统：开始日期必须早于结束日期
+const startDateField: DateField = {
+  name: 'startDate',
+  type: 'date',
+  required: true,
+  validate: (value, { event, data, siblingData }) => {
+    if (!value) return '请选择开始日期'
+    
+    // 跨字段验证仅在服务端提交时执行
+    // 客户端 onChange 时 siblingData 可能不完整
+    if (event === 'submit') {
+      const endDate = data?.endDate || siblingData?.endDate
+      if (endDate && new Date(value) > new Date(endDate)) {
+        return '开始日期必须早于结束日期'
+      }
+    }
+    
+    return true
+  }
+}
+
+const endDateField: DateField = {
+  name: 'endDate',
+  type: 'date',
+  required: true,
+  validate: (value, { event, data, siblingData }) => {
+    if (!value) return '请选择结束日期'
+    
+    if (event === 'submit') {
+      const startDate = data?.startDate || siblingData?.startDate
+      if (startDate && new Date(value) < new Date(startDate)) {
+        return '结束日期必须晚于开始日期'
+      }
+    }
+    
+    return true
+  }
+}
+
+// 或使用 collection 级别的钩子
+const collectionConfig = {
+  slug: 'promotions',
+  fields: [startDateField, endDateField],
+  hooks: {
+    beforeChange: [
+      async ({ data }) => {
+        if (data.startDate && data.endDate) {
+          if (new Date(data.startDate) > new Date(data.endDate)) {
+            throw new ValidationError([{
+              message: '开始日期必须早于结束日期',
+              path: 'startDate',
+            }])
+          }
+        }
+        return data
+      }
+    ]
+  }
+}
+```
+
+**失配流程：**
+1. 用户先选择开始日期 `2025-01-15` → 客户端验证通过
+2. 用户选择结束日期 `2025-01-10`（早于开始日期）→ 单独验证通过
+3. 客户端实时验证 `event = 'onChange'`，跨字段检查被跳过
+4. 用户点击保存
+5. 服务端 `beforeChange` 验证：
+   - `event = 'submit'`
+   - 有完整的 `data` 和 `siblingData`
+   - 发现日期顺序错误
+6. 错误可能关联到：
+   - `startDate`（提示用户检查）
+   - `endDate`（提示用户检查）
+   - 或两个字段都关联
+7. 客户端显示错误，用户需要调整其中一个日期
+
+**为什么客户端不执行跨字段验证？**
+
+查看 `useField` 的验证调用：
+```typescript
+// useField/index.tsx
+const data = getData()  // 当前表单数据快照
+
+// 客户端 onChange 时：
+// 1. 用户刚修改完字段，data 可能还是旧值
+// 2. 节流 150ms 后执行，时机不确定
+// 3. blockData 明确传递为 undefined（性能考虑）
+
+// 而服务端 submit 时：
+const data = deepMergeWithSourceArrays(doc, data)  // 合并已有文档和提交数据
+const siblingData = deepMergeWithSourceArrays(siblingDoc, siblingData)
+const blockData = blockData!  // 完整的 block 数据
+```
+
+**收敛机制特点：**
+
+1. **路径精确映射**：服务端错误通过 `path` 精确对应到字段
+2. **嵌套路径支持**：支持 `blocks.0.fieldName` 等嵌套结构
+3. **父级聚合**：`errorPaths` 让父字段知道子字段有错误
+4. **草稿保护**：草稿提交失败保持 `modified` 状态，允许重试
+5. **状态同步**：`submitted` 标志控制 UI 是否显示错误
+
+### 9.5 一致性收敛的关键保证
+
+| 保证维度 | 实现机制 | 关键文件 |
+|---------|---------|---------|
+| **错误精确映射** | `path` 字段作为桥梁 | ValidationError.ts, fieldReducer.ts |
+| **嵌套结构支持** | 点分隔路径，父级 errorPaths 聚合 | fieldReducer.ts:87-129 |
+| **状态同步** | `ADD_SERVER_ERRORS` action 原子更新 | fieldReducer.ts:72-132 |
+| **UI 触发条件** | `submitted && !valid` 双条件 | useField/index.tsx:62 |
+| **i18n 一致性** | 错误消息在服务端构造时翻译 | ValidationError.ts:39-44, 52-70 |
+| **草稿友好** | 失败后保持 modified 状态 | Form/index.tsx:463-468 |
+
+## 10. 结论
 
 Payload CMS 的自定义字段验证采用**"单点定义，多点执行"**的策略：
 
@@ -430,4 +856,10 @@ Payload CMS 的自定义字段验证采用**"单点定义，多点执行"**的�
    - 服务端负责安全（数据清洗、最终验证）
 5. **类型安全**：通过自动类型转换和 JSON Schema 双重保障
 
-这种设计既保证了良好的用户体验（即时反馈），又确保了数据的安全性（服务端最终验证），同时通过共享验证函数避免了逻辑重复。
+**失败收敛核心机制：**
+- 服务端错误通过 `ValidationFieldError` 结构化收集
+- `path` 字段作为服务端-客户端的精确映射桥梁
+- `ADD_SERVER_ERRORS` 动作原子更新表单状态
+- `submitted` 标志控制错误 UI 的显示时机
+
+这种设计既保证了良好的用户体验（即时反馈），又确保了数据的安全性（服务端最终验证），同时通过共享验证函数避免了逻辑重复。在客户端和服务端验证结果不一致时，系统有完整的闭环机制将服务端的权威结果同步回客户端，最终达到一致性收敛。
