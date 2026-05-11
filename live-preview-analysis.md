@@ -40,6 +40,100 @@ Live Preview 采用浏览器原生的 `window.postMessage` API 作为跨上下�
 
 前端预览页面向后台管理界面发送"已就绪"信号，告知后台可以开始发送数据更新。
 
+### 3.1.1 postMessage 与 CORS 的边界差异
+
+Live Preview 使用 `window.postMessage` 进行跨窗口通信。需要明确：
+
+| 机制 | 控制对象 | 生效边界 | 核心参数 |
+|-----|---------|---------|---------|
+| **CORS** | `XMLHttpRequest` / `fetch` | 跨域 HTTP 请求 | `Access-Control-Allow-Origin` 响应头 |
+| **postMessage** | 窗口间消息投递 | iframe / popup 跨窗口通信 | `targetOrigin` 参数（调用时指定） |
+
+**关键区别**：
+- CORS 由**服务器**通过响应头控制，决定浏览器是否允许 JS 读取跨域响应
+- postMessage 由**调用方**通过 `targetOrigin` 控制，决定目标窗口是否能接收消息
+- 两者互不影响：即使 CORS 不允许跨域请求，postMessage 仍可投递消息（只要 targetOrigin 匹配）
+
+### 3.1.2 targetOrigin / serverURL 必须为纯 origin
+
+#### 原因：浏览器 postMessage API 规范
+
+根据 HTML 规范和浏览器实现，`postMessage(message, targetOrigin)` 的 `targetOrigin` 参数要求：
+
+1. **`targetOrigin` 的语义**：指定"目标窗口的文档来源"必须匹配
+2. **origin 的定义**：协议 + 主机 + 端口（如 `http://localhost:3000`）
+3. **origin 不包含**：路径、查询参数、哈希等
+
+**浏览器行为**：
+- 若 `targetOrigin` 不是合法 origin（含路径），浏览器在投递时会**静默忽略**或**拒绝投递**
+- 目标窗口的 `message` 事件不会被触发
+- 不抛出异常，难以调试
+
+#### 错误 vs 正确
+
+| 用法 | 值 | 结果 |
+|-----|-----|-----|
+| ❌ 错误 | `http://localhost:3000/preview` | 含路径，投递失败 |
+| ❌ 错误 | `http://localhost:3000/posts/123` | 含路径，投递失败 |
+| ✅ 正确 | `http://localhost:3000` | 纯 origin，投递成功 |
+| ✅ 正确 | `https://admin.example.com` | 纯 origin，投递成功 |
+| ✅ 正确 | `"*"` | 通配符（不推荐，安全风险） |
+
+#### 异常表现：两条失败路径
+
+**路径 1：投递阶段失败（targetOrigin 含路径）**
+
+```
+后台管理端 (Admin)                    前端预览端 (Frontend)
+        |                                     |
+        |  postMessage(                       |
+        |    { type: 'payload-live-preview' },|
+        |    'http://localhost:3000/preview'  |
+        |        ↑ 含路径                      |
+        |  )                                  |
+        |----|                                |
+             |
+             ▼
+    浏览器静默拒绝投递
+    目标窗口 message 事件不触发
+    无任何异常抛出
+```
+
+**路径 2：接收校验失败（serverURL 含路径）**
+
+```
+假设消息投递成功（targetOrigin 正确），但 serverURL 配置含路径：
+
+后台管理端                          前端预览端
+        |                                 |
+        |  postMessage(                   |
+        |    { type: 'payload-live-preview' },|
+        |    'http://localhost:3000'     |  ✅ targetOrigin 正确
+        |  )                              |
+        |------------------------------->|
+                                          |
+                                          |  event.origin = 'http://localhost:3000'
+                                          |
+                                          |  isLivePreviewEvent(event, serverURL)
+                                          |  serverURL = 'http://localhost:3000/preview'
+                                          |
+                                          |  校验逻辑：
+                                          |  event.origin === serverURL
+                                          |  'http://localhost:3000' === 'http://localhost:3000/preview'
+                                          |  → false ❌
+                                          |
+                                          |  结果：消息被忽略，不触发更新
+```
+
+#### 代码中的实际问题
+
+| 使用位置 | 代码文件 | 变量 | 可能含路径 | 风险类型 |
+|---------|---------|-----|-----------|---------|
+| 后台发送数据 | `packages/ui/src/elements/LivePreview/Window/index.tsx:72,77,112,117` | `url` | ✅ 预览页面 URL 可能含路径 | **路径 1：投递失败** |
+| 前端发送 ready | `packages/live-preview/src/ready.ts:15` | `serverURL` | 取决于用户配置 | **路径 1：投递失败** |
+| 前端校验 | `packages/live-preview/src/isLivePreviewEvent.ts:2` | `serverURL` | 取决于用户配置 | **路径 2：校验失败** |
+| 前端校验 | `packages/live-preview/src/isDocumentEvent.ts:2` | `serverURL` | 取决于用户配置 | **路径 2：校验失败** |
+
 ### 3.2 消息格式
 
 **前端发送** (`packages/live-preview/src/ready.ts:1-18`)：
@@ -517,17 +611,17 @@ export default async function Page({ params }) {
 | `packages/ui/src/providers/LivePreview/index.tsx` | Ready 信号接收与 appIsReady 状态管理 |
 | `packages/ui/src/providers/DocumentEvents/index.tsx` | 文档事件上下文（mostRecentUpdate） |
 
-## 9. 总结
+## 10. 总结
 
-### 9.1 核心技术栈
+### 10.1 核心技术栈
 
-- **传输协议**：`window.postMessage`
+- **传输协议**：`window.postMessage`（与 CORS 是两套独立机制）
 - **握手通道**：`payload-live-preview` + `ready: true`（前端 → 后台）
 - **数据通道 B.1**：`payload-live-preview` + 表单数据（后台 → 前端，Client-side）
 - **数据通道 B.2**：`payload-document-event`（后台 → 前端，Server-side）
 - **关系解析**：REST API POST + `X-Payload-HTTP-Method-Override: GET`
 
-### 9.2 两种同步模式对比
+### 10.2 两种同步模式对比
 
 | 特性 | Client-side（表单实时数据） | Server-side（文档保存事件） |
 |-----|---------------------------|---------------------------|
@@ -538,7 +632,32 @@ export default async function Page({ params }) {
 | **React 封装** | `useLivePreview` hook | `RefreshRouteOnSave` 组件 |
 | **Vue 封装** | `useLivePreview` composable | 无（需自行实现） |
 
-### 9.3 数据流时序图（完整版）
+### 10.3 关键注意事项
+
+#### 10.3.1 postMessage 与 CORS 的边界
+
+| 机制 | 控制对象 | 生效边界 |
+|-----|---------|---------|
+| CORS | `XMLHttpRequest` / `fetch` | 跨域 HTTP 请求 |
+| postMessage | 窗口间消息投递 | iframe / popup 跨窗口通信 |
+
+**结论**：两者互不影响，不能混淆。
+
+#### 10.3.2 targetOrigin / serverURL 必须为纯 origin
+
+- ✅ 正确：`http://localhost:3000`
+- ❌ 错误：`http://localhost:3000/preview`
+
+**影响**：
+- 含路径会导致 `postMessage` 投递失败
+- 含路径会导致 `event.origin === serverURL` 校验永远失败
+
+#### 10.3.3 externallyUpdatedRelationship 未被消费
+
+- 定义并发送，但在 `handleMessage` 中完全未使用
+- 属于预留扩展或未完成功能
+
+### 10.4 数据流时序图（完整版）
 
 ```
 ┌─────────────────┐                                 ┌─────────────────┐
