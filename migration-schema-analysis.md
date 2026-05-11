@@ -976,9 +976,671 @@ export const pushDevSchema = async (adapter: DrizzleAdapter) => {
 }
 ```
 
-## 七、适配器差异总览
+## 七、派生适配器的继承边界分析
 
-### 7.1 功能差异矩阵
+本章专门分析 Vercel Postgres 和 D1 SQLite 这两个派生适配器，它们如何通过"组合模式"而非传统类继承来复用父适配器的逻辑。
+
+### 7.1 继承模式：组合 vs 继承
+
+**关键洞察**：Vercel Postgres 和 D1 SQLite 并不通过传统的类继承方式（如 `class VercelPostgresAdapter extends PostgresAdapter`）来复用代码，而是通过**组合模式**：
+
+- 直接导入 `@payloadcms/drizzle/postgres` 或 `@payloadcms/drizzle/sqlite` 中的函数
+- 在 `createDatabaseAdapter` 配置中选择性覆盖特定属性
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      组合复用模式                              │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│   @payloadcms/drizzle/postgres                               │
+│   ├─ init (结构同步入口)         ← 直接导入复用                │
+│   ├─ buildDrizzleTable (列转换)  ← 直接导入复用                │
+│   ├─ execute (执行器)           ← 直接导入复用                │
+│   └─ ...                                                       │
+│                              ↓                                 │
+│   @payloadcms/db-vercel-postgres                              │
+│   ├─ 导入 postgres 的 init/buildDrizzleTable 等               │
+│   ├─ 自定义 connect (连接层)    ← 覆盖                         │
+│   ├─ forceUseVercelPostgres      ← 新增属性                    │
+│   └─ readReplicasAfterWriteInterval ← 新增属性                 │
+│                                                              │
+│   (没有任何结构同步相关的自定义代码)                            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 SQLite 家族：D1 SQLite 与 SQLite 的复用链路
+
+#### 7.2.1 导入关系对比
+
+**SQLite 适配器** (`packages/db-sqlite/src/index.ts:1-56`):
+
+```typescript
+// 从 @payloadcms/drizzle 导入的结构同步相关函数
+import {
+  beginTransaction,
+  buildCreateMigration,
+  buildSchemaGenerator,
+  // ... CRUD 方法
+} from '@payloadcms/drizzle'
+
+// 从 @payloadcms/drizzle/sqlite 导入的 SQLite 特定实现
+import {
+  columnToCodeConverter,   // Schema 生成
+  countDistinct,           // 查询
+  defaultDrizzleSnapshot, // 快照
+  dropDatabase,
+  execute,               // 执行器（SQLite 版本）
+  init,                  // ← 关键：结构同步入口
+  insert,
+  requireDrizzleKit,
+} from '@payloadcms/drizzle/sqlite'
+```
+
+**D1 SQLite 适配器** (`packages/db-d1-sqlite/src/index.ts:1-62`):
+
+```typescript
+// 从 @payloadcms/drizzle 导入的结构同步相关函数 ← 完全相同
+import {
+  beginTransaction,
+  buildCreateMigration,
+  buildSchemaGenerator,
+  // ... 完全相同的导入
+} from '@payloadcms/drizzle'
+
+// 从 @payloadcms/drizzle/sqlite 导入的 SQLite 特定实现 ← 完全相同
+import {
+  columnToCodeConverter,
+  countDistinct,
+  defaultDrizzleSnapshot,
+  dropDatabase,
+  init,                  // ← 复用同一个 init！
+  insert,
+  requireDrizzleKit,
+  // 注意：没有导入 execute！
+} from '@payloadcms/drizzle/sqlite'
+
+// 自定义实现
+import { connect } from './connect.js'   // ← 自定义 connect
+import { execute } from './execute.js'           // ← 自定义 execute
+```
+
+**关键差异：execute 和 connect 被覆盖，init 和 buildDrizzleTable 完全复用**
+
+#### 7.2.2 结构同步复用链路（完全相同
+
+**SQLite init** (`packages/drizzle/src/sqlite/init.ts:12-45`):
+
+```typescript
+// 这个 init 函数同时被 SQLite 和 D1 SQLite 使用
+export const init: Init = async function init(this: BaseSQLiteAdapter) {
+  let locales: string[] | undefined
+
+  this.rawRelations = {}
+  this.rawTables = {}
+
+  if (this.payload.config.localization) {
+    locales = this.payload.config.localization.locales.map(({ code }) => code)
+  }
+
+  const adapter = this as unknown as DrizzleAdapter
+
+  // 步骤 1: 构建抽象 RawTable（数据库无关）
+  buildRawSchema({
+    adapter,
+    setColumnID,
+  })
+
+  // 步骤 2: beforeSchemaInit 钩子
+  await executeSchemaHooks({ type: 'beforeSchemaInit', adapter: this })
+
+  // 步骤 3: 数据库特定转换（SQLite 方言）
+  for (const tableName in this.rawTables) {
+    buildDrizzleTable({ adapter, locales, rawTable: this.rawTables[tableName] })
+  }
+
+  // 步骤 4: 构建关系
+  buildDrizzleRelations({ adapter })
+
+  // 步骤 5: afterSchemaInit 钩子
+  await executeSchemaHooks({ type: 'afterSchemaInit', adapter: this })
+
+  // 步骤 6: 组装 schema
+  this.schema = {
+    ...this.tables,
+    ...this.relations,
+  }
+}
+```
+
+**buildDrizzleTable** (`packages/drizzle/src/sqlite/schema/buildDrizzleTable.ts:23-150`):
+
+```typescript
+// 这个函数同时被 SQLite 和 D1 SQLite 使用
+export const buildDrizzleTable: BuildDrizzleTable = ({ adapter, locales, rawTable }) => {
+  const columns: Record<string, any> = {}
+
+  for (const [key, column] of Object.entries(rawTable.columns)) {
+    switch (column.type) {
+      case 'boolean':
+        columns[key] = integer(column.name, { mode: 'boolean' })
+        break
+      case 'enum':
+        if ('locale' in column) {
+          columns[key] = text(column.name, { enum: locales as [string, ...string[]] })
+        } else {
+          columns[key] = text(column.name, { enum: column.options as [string, ...string[]] })
+        }
+        break
+      // ... 其他列类型处理
+    }
+  }
+  // ... 外键、索引等
+}
+```
+
+#### 7.2.3 继承边界总结
+
+| 模块 | SQLite | D1 SQLite | 差异原因 |
+|------|--------|-----------|---------|
+| **init** | 导入自 @payloadcms/drizzle/sqlite | **完全相同** | 结构同步逻辑与具体驱动无关 |
+| **buildRawSchema** | 导入自 @payloadcms/drizzle/schema | **完全相同** | 完全抽象的 Schema 构建 |
+| **buildDrizzleTable** | SQLite 方言转换 | **完全相同** | SQLite 方言统一 |
+| **connect** | 本地实现（libsql + WAL 配置） | **自定义** | 不同的驱动（libsql vs D1） |
+| **execute** | 导入自 @payloadcms/drizzle/sqlite | **自定义** | D1 需要结果格式映射 |
+| **buildCreateMigration** | SQLite 策略（run + 转义） | **完全相同** | SQLite 方言统一 |
+| **init 执行器** | run + 转义 | **完全相同** | SQLite 方言统一 |
+
+**结论：D1 SQLite 在结构同步层面与 SQLite 完全一致，差异只在连接和执行层。
+
+### 7.3 Postgres 家族：Vercel Postgres 与 Postgres 的复用链路
+
+#### 7.3.1 导入关系对比
+
+**Postgres 适配器** (`packages/db-postgres/src/index.ts:1-57`):
+
+```typescript
+// 从 @payloadcms/drizzle 导入
+import {
+  beginTransaction,
+  buildCreateMigration,
+  buildSchemaGenerator,
+} from '@payloadcms/drizzle'
+
+// 从 @payloadcms/drizzle/postgres 导入 Postgres 特定实现
+import {
+  columnToCodeConverter,
+  countDistinct,
+  createDatabase,
+  createExtensions,   // Postgres 扩展
+  execute,
+  init,              // ← 结构同步入口
+  insert,
+  requireDrizzleKit,
+} from '@payloadcms/drizzle/postgres'
+
+// 驱动依赖
+import { pgEnum, pgSchema, pgTable } from 'drizzle-orm/pg-core'
+import pgDependency from 'pg'   // ← node-postgres 驱动
+```
+
+**Vercel Postgres 适配器** (`packages/db-vercel-postgres/src/index.ts:1-58`):
+
+```typescript
+// 从 @payloadcms/drizzle 导入 ← 完全相同
+import {
+  beginTransaction,
+  buildCreateMigration,
+  buildSchemaGenerator,
+} from '@payloadcms/drizzle'
+
+// 从 @payloadcms/drizzle/postgres 导入 ← 完全相同
+import {
+  columnToCodeConverter,
+  countDistinct,
+  createDatabase,
+  createExtensions,
+  execute,            // ← 复用同一个 execute
+  init,              // ← 复用同一个 init
+  insert,
+  requireDrizzleKit,
+} from '@payloadcms/drizzle/postgres'
+
+// 驱动依赖
+import { pgEnum, pgSchema, pgTable } from 'drizzle-orm/pg-core'
+// 没有导入 pg！使用 Vercel 驱动
+```
+
+#### 7.3.2 结构同步复用链路（完全相同）
+
+**Postgres init** (`packages/drizzle/src/postgres/init.ts:11-45`):
+
+```typescript
+// 这个 init 函数同时被 Postgres 和 Vercel Postgres 使用
+export const init: Init = async function init(this: BasePostgresAdapter) {
+  this.rawRelations = {}
+  this.rawTables = {}
+
+  // 步骤 1: 构建抽象 RawTable
+  buildRawSchema({
+    adapter: this,
+    setColumnID,
+  })
+
+  // 步骤 2: beforeSchemaInit 钩子
+  await executeSchemaHooks({ type: 'beforeSchemaInit', adapter: this })
+
+  // 步骤 3: Postgres 特有：创建 locale 枚举
+  if (this.payload.config.localization) {
+    this.enums.enum__locales = this.pgSchema.enum(
+      '_locales',
+      this.payload.config.localization.locales.map(({ code }) => code) as [string, ...string[]],
+    )
+  }
+
+  // 步骤 4: Postgres 特定转换
+  for (const tableName in this.rawTables) {
+    buildDrizzleTable({ adapter: this, rawTable: this.rawTables[tableName] })
+  }
+
+  // 步骤 5: 构建关系
+  buildDrizzleRelations({ adapter: this })
+
+  // 步骤 6: afterSchemaInit 钩子
+  await executeSchemaHooks({ type: 'afterSchemaInit', adapter: this })
+
+  // 步骤 7: 组装 schema（包含枚举）
+  this.schema = {
+    pgSchema: this.pgSchema,
+    ...this.tables,
+    ...this.relations,
+    ...this.enums,
+  }
+}
+```
+
+**buildDrizzleTable** (`packages/drizzle/src/postgres/schema/buildDrizzleTable.ts`):
+
+```typescript
+// 这个函数同时被 Postgres 和 Vercel Postgres 使用
+export const buildDrizzleTable: BuildDrizzleTable = ({ adapter, rawTable }) => {
+  const columns: Record<string, any> = {}
+
+  for (const [key, column] of Object.entries(rawTable.columns)) {
+    switch (column.type) {
+      case 'enum':
+        if ('locale' in column) {
+          columns[key] = adapter.enums.enum__locales(column.name)
+        } else {
+          adapter.enums[column.enumName] = adapter.pgSchema.enum(
+            column.enumName,
+            column.options as [string, ...string[]],
+          )
+          columns[key] = adapter.enums[column.enumName](column.name)
+        }
+        break
+      // ... 其他列类型处理（uuid、timestamp、vector 等）
+    }
+  }
+  // ... 外键、索引等
+}
+```
+
+#### 7.3.3 继承边界总结
+
+| 模块 | Postgres | Vercel Postgres | 差异原因 |
+|------|----------|-----------------|---------|
+| **init** | 导入自 @payloadcms/drizzle/postgres | **完全相同** | 结构同步逻辑与具体驱动无关 |
+| **buildRawSchema** | 导入自 @payloadcms/drizzle/schema | **完全相同** | 完全抽象的 Schema 构建 |
+| **buildDrizzleTable** | Postgres 方言转换 | **完全相同** | Postgres 方言统一 |
+| **execute** | 导入自 @payloadcms/drizzle/postgres | **完全相同** | 执行逻辑与驱动无关 |
+| **connect** | 本地实现（pg 连接池） | **自定义** | 不同的驱动（pg vs VercelPool） |
+| **buildCreateMigration** | Postgres 策略（execute + 不转义） | **完全相同** | Postgres 方言统一 |
+| **createExtensions** | 导入自 @payloadcms/drizzle/postgres | **完全相同** | 扩展创建与驱动无关 |
+
+**结论：Vercel Postgres 在结构同步层面与 Postgres 完全一致，差异只在连接层。
+
+## 八、连接层差异 vs 结构同步差异：代码证据
+
+### 8.1 层次划分
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  层次划分                                                    │
+├────────────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  连接层（Connection Layer）                          │    │
+│  │  差异：驱动选择、连接池、读副本、WAL 等              │    │
+│  │  不影响结构同步结果                              │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  结构同步层（Schema Sync Layer）                    │    │
+│  │  差异：列类型映射、枚举实现、时间戳处理等       │    │
+│  │  影响表结构                                   │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  抽象 Schema 层（Abstract Layer）                     │    │
+│  │  无差异：buildRawSchema 完全统一                  │    │
+│  │  统一生成 RawTable/RawColumn                   │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                                                              │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 连接层差异（不影响结构同步结果
+
+#### 8.2.1 SQLite vs D1 SQLite 连接层差异
+
+**SQLite 连接** (`packages/db-sqlite/src/connect.ts:10-76`):
+
+```typescript
+export const connect: Connect = async function connect(this: SQLiteAdapter, options) {
+  const { hotReload } = options
+
+  try {
+    if (!this.client) {
+      // 差异点 1: libsql 客户端创建
+      this.client = createClient(this.clientConfig)
+
+      // 差异点 2: SQLite 特定的 PRAGMA 配置（D1 不支持）
+      if (this.busyTimeout > 0) {
+        await this.client.execute(`PRAGMA busy_timeout = ${this.busyTimeout};`)
+      }
+
+      // 差异点 3: WAL 模式配置（D1 内部实现，用户无法配置）
+      if (this.wal) {
+        const result = await this.client.execute('PRAGMA journal_mode;')
+        if (result.rows[0]?.journal_mode !== 'wal') {
+          await this.client.execute(`PRAGMA journal_mode = WAL;`)
+          await this.client.execute(`PRAGMA journal_size_limit = ${this.wal.journalSizeLimit};`)
+        }
+        await this.client.execute(`PRAGMA synchronous = ${this.wal.synchronous};`)
+      }
+    }
+
+    // 差异点 4: libsql drizzle 驱动
+    const logger = this.logger || false
+    this.drizzle = drizzle(this.client, { logger, schema: this.schema })
+    this.client = this.drizzle.$client
+  }
+  // ... pushDevSchema、migrate 等后续步骤完全相同
+}
+```
+
+**D1 SQLite 连接** (`packages/db-d1-sqlite/src/connect.ts:9-73`):
+
+```typescript
+export const connect: Connect = async function connect(this: SQLiteD1Adapter, options) {
+  const { hotReload } = options
+
+  // 差异点 1: D1 binding 直接使用，不需要创建客户端
+  this.schema = {
+    ...this.tables,
+    ...this.relations,
+  }
+
+  try {
+    const logger = this.logger || false
+    const readReplicas = this.readReplicas
+
+    let binding = this.binding
+
+    // 差异点 2: D1 特有：只读副本策略
+    if (readReplicas && readReplicas === 'first-primary') {
+      // @ts-expect-error
+      binding = this.binding.withSession('first-primary')
+    }
+
+    // 差异点 3: D1 drizzle 驱动
+    this.drizzle = drizzle(binding, {
+      logger,
+      schema: this.schema,
+    })
+
+    this.client = this.drizzle.$client as any
+  }
+  // ... pushDevSchema、migrate 等后续步骤完全相同
+}
+```
+
+**D1 SQLite 执行器差异** (`packages/db-d1-sqlite/src/execute.ts:40-67`):
+
+```typescript
+// 差异：D1 返回的结果格式与 libsql 不同，需要映射
+export const execute: Execute<any> = function execute({ db, drizzle, raw, sql: statement }) {
+  const executeFrom: any = (db ?? drizzle)!
+
+  const mapToLibSql = (query: SQLiteRaw<D1Result<unknown>>): any => {
+    const execute = query.execute
+    query.execute = async () => {
+      const result: D1Result = await execute()
+
+      // D1 特有：需要映射到 LibSQL 兼容格式
+      const resultLibSQL = {
+        columns: undefined,
+        columnTypes: undefined,
+        lastInsertRowid: BigInt(result.meta.last_row_id),
+        rows: result.results as any[],
+        rowsAffected: result.meta.rows_written,
+      }
+
+      return Object.assign(result, resultLibSQL)
+    }
+
+    return query
+  }
+
+  if (raw) {
+    return mapToLibSql(executeFrom.run(sql.raw(raw)))
+  }
+  // ...
+}
+```
+
+**连接层差异总结：
+
+| 特性 | SQLite | D1 SQLite | 是否影响结构同步 |
+|------|--------|-----------|---------------|
+| **客户端创建** | `createClient(clientConfig)` | 直接使用 `binding` | ❌ 否 |
+| **WAL 配置** | 可配置 | D1 内部实现 | ❌ 否 |
+| **busy_timeout** | 可配置 | D1 内部实现 | ❌ 否 |
+| **只读副本** | 无 | `withSession('first-primary') | ❌ 否 |
+| **驱动** | `drizzle-orm/libsql` | `drizzle-orm/d1` | ❌ 否 |
+| **结果格式** | LibSQL 原生 | 需要映射 | ❌ 否 |
+
+**这些差异都只影响运行时行为，不影响表结构生成。
+
+#### 8.2.2 Postgres vs Vercel Postgres 连接层差异
+
+**Postgres 连接** (`packages/db-postgres/src/connect.ts:47-133`):
+
+```typescript
+export const connect: Connect = async function connect(this: PostgresAdapter, options) {
+  const { hotReload } = options
+
+  try {
+    if (!this.pool) {
+      // 差异点 1: pg 连接池
+      this.pool = new this.pg.Pool(this.poolOptions)
+
+      // 差异点 2: 自动重连逻辑
+      await connectWithReconnect({ adapter: this, pool: this.pool })
+    }
+
+    const logger = this.logger || false
+    this.drizzle = drizzle({ client: this.pool, logger, schema: this.schema })
+
+    // 差异点 3: 读副本（使用 pg.Pool
+    if (this.readReplicaOptions) {
+      this.primaryDrizzle = this.drizzle as any
+      const readReplicas = this.readReplicaOptions.map((connectionString) => {
+        const pool = new this.pg.Pool(options)
+        return drizzle({ client: pool, logger, schema: this.schema })
+      })
+      const myReplicas = withReplicas(this.drizzle, readReplicas as any)
+      this.drizzle = myReplicas
+    }
+  }
+  // ... createExtensions、pushDevSchema、migrate 等后续步骤完全相同
+}
+```
+
+**Vercel Postgres 连接** (`packages/db-vercel-postgres/src/connect.ts:12-115`):
+
+```typescript
+export const connect: Connect = async function connect(this: VercelPostgresAdapter, options) {
+  const { hotReload } = options
+
+  const connectionString = this.poolOptions?.connectionString ?? process.env.POSTGRES_URL
+
+  try {
+    let client: pg.Pool | VercelPool
+
+    // 差异点 1: 本地开发自动降级到 pg
+    if (
+      !this.forceUseVercelPostgres &&
+      connectionString &&
+      ['127.0.0.1', 'localhost'].includes(new URL(connectionString).hostname)
+    ) {
+      // 本地：使用 pg.Pool
+      client = new pg.Pool(this.poolOptions ?? { connectionString })
+    } else {
+      // 生产：使用 VercelPool
+      client = this.poolOptions ? new VercelPool(this.poolOptions) : sql
+    }
+
+    // 差异点 2: Vercel 读副本（使用 VercelPool）
+    this.drizzle = drizzle({ client: client as pg.Pool, logger, schema: this.schema })
+
+    if (this.readReplicaOptions) {
+      this.primaryDrizzle = this.drizzle as any
+      const readReplicas = this.readReplicaOptions.map((connectionString) => {
+        const pool = new VercelPool(options)
+        return drizzle({ client: pool as unknown as pg.Pool, logger, schema: this.schema })
+      })
+      const myReplicas = withReplicas(this.drizzle, readReplicas as any)
+      this.drizzle = myReplicas
+    }
+  }
+  // ... createExtensions、pushDevSchema、migrate 等后续步骤完全相同
+}
+```
+
+**连接层差异总结：
+
+| 特性 | Postgres | Vercel Postgres | 是否影响结构同步 |
+|------|----------|-------------------|---------------|
+| **驱动** | `pg.Pool` (node-postgres) | `VercelPool` (@vercel/postgres) | ❌ 否 |
+| **本地开发驱动** | 固定 pg | 自动降级到 pg | ❌ 否 |
+| **自动重连** | `connectWithReconnect | 无（Vercel 驱动内部实现 | ❌ 否 |
+| **forceUseVercelPostgres** | 无 | 强制使用 Vercel 驱动 | ❌ 否 |
+| **读副本** | pg.Pool 读副本 | VercelPool 读副本 | ❌ 否 |
+
+**这些差异都只影响连接管理和运行时性能，不影响表结构生成。
+
+### 8.3 结构同步层差异（影响表结构）
+
+#### 8.3.1 SQLite vs Postgres 结构同步差异（真正影响表结构）
+
+**Postgres init 差异点：
+
+```typescript
+// packages/drizzle/src/postgres/init.ts:22-27
+
+// Postgres 特有：创建枚举类型
+if (this.payload.config.localization) {
+  this.enums.enum__locales = this.pgSchema.enum(
+    '_locales',
+    this.payload.config.localization.locales.map(({ code }) => code) as [string, ...string[]],
+  )
+}
+```
+
+**SQLite init 差异点：**
+
+```typescript
+// packages/drizzle/src/sqlite/init.ts:18-20
+
+// SQLite：不支持枚举类型，locales 只用于 TEXT check 约束
+if (this.payload.config.localization) {
+  locales = this.payload.config.localization.locales.map(({ code }) => code)
+}
+```
+
+**Postgres buildDrizzleTable 列类型映射：
+
+```typescript
+// 枚举：原生 ENUM
+case 'enum':
+  columns[key] = adapter.enums.enum__locales(column.name)
+
+// 时间戳：原生 timestamp
+case 'timestamp':
+  let builder = timestamp(column.name, {
+    mode: column.mode,
+    precision: column.precision,
+    withTimezone: column.withTimezone,  // 支持时区
+  })
+  if (column.defaultNow) {
+    builder = builder.defaultNow()  // 数据库级别
+  }
+
+// UUID：原生 uuid
+case 'uuid':
+  let builder = uuid(column.name)
+  if (column.defaultRandom) {
+    builder = builder.defaultRandom()  // gen_random_uuid()
+  }
+
+// 向量：pgvector 特有
+case 'vector':
+case 'halfvec':
+case 'sparsevec':
+case 'bit':
+  columns[key] = vector(column.name, { dimensions: column.dimensions })
+```
+
+**SQLite buildDrizzleTable 列类型映射：
+
+```typescript
+// 枚举：TEXT + check 约束
+case 'enum':
+  columns[key] = text(column.name, { enum: locales as [string, ...string[]] })
+
+// 时间戳：TEXT + strftime
+case 'timestamp':
+  let builder = text(column.name)
+  if (column.defaultNow) {
+    builder = builder.default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
+  }
+
+// UUID：TEXT + 应用层
+case 'uuid':
+  let builder = text(column.name, { length: 36 })
+  if (column.defaultRandom) {
+    builder = builder.$defaultFn(() => uuidv4())  // 应用层生成
+  }
+
+// 向量：不支持
+// 无 vector/halfvec/sparsevec/bit 处理
+```
+
+**结构同步层差异总结（影响表结构）：
+
+| 特性 | Postgres | SQLite | 影响 |
+|------|----------|--------|------|
+| **枚举** | 原生 ENUM 类型 | TEXT + check 约束 | ✅ 表结构不同 |
+| **布尔** | 原生 boolean | INTEGER + mode | ✅ 列类型不同 |
+| **时间戳** | 原生 timestamp (支持时区) | TEXT + strftime | ✅ 列类型不同 |
+| **UUID** | 原生 uuid + gen_random_uuid() | TEXT + 应用层默认值 | ✅ 列类型不同 |
+| **向量** | pgvector 支持 | 不支持 | ✅ 功能差异 |
+| **Schema 组装** | 包含 pgSchema + enums | 只有 tables + relations | ✅ 结构不同 |
+
+**这些是真正影响表结构的差异，发生在结构同步层。
+
+## 九、功能差异矩阵
 
 | 特性 | MongoDB | Postgres | Vercel Postgres | SQLite | D1 SQLite |
 |------|---------|----------|-----------------|--------|-----------|
@@ -997,7 +1659,7 @@ export const pushDevSchema = async (adapter: DrizzleAdapter) => {
 | **Schema 扩展** | 无 | postgis 等 | postgis 等 | 无 | 无 |
 | **事务支持** | session | Drizzle transaction | Drizzle transaction | Drizzle transaction | Drizzle transaction |
 
-### 7.2 Postgres 派生适配器：Vercel Postgres 差异
+### 9.1 Postgres 派生适配器：Vercel Postgres 差异
 
 **文件**: `packages/db-vercel-postgres/src/connect.ts:12-115`
 
