@@ -844,7 +844,603 @@ const blockData = blockData!  // 完整的 block 数据
 | **i18n 一致性** | 错误消息在服务端构造时翻译 | ValidationError.ts:39-44, 52-70 |
 | **草稿友好** | 失败后保持 modified 状态 | Form/index.tsx:463-468 |
 
-## 10. 结论
+## 10. 提交失败后的恢复链路
+
+当用户修正输入并重试提交时，系统需要清除历史错误并重新对齐状态。以下是完整的恢复流程。
+
+### 10.1 恢复链路总览
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   提交失败恢复链路                                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  阶段 1：用户修正输入 → 本地验证触发                                      │
+│  ───────────────────────────────────────                                │
+│  - 用户修改错误字段的值                                                   │
+│  - useField 节流验证 (150ms) 重新运行                                    │
+│  - 根据新值重新计算 errorMessage 和 valid                                 │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  阶段 2：本地状态更新 → 清除历史错误                                      │
+│  ───────────────────────────────────────                                │
+│  - UPDATE action 更新字段状态                                            │
+│  - 新验证结果覆盖旧的服务端错误                                           │
+│  - errorPaths 不会自动清除（需等服务端状态合并）                          │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  阶段 3：onChange 防抖 → 服务端状态重建                                  │
+│  ───────────────────────────────────────                                │
+│  - 防抖 250ms 后触发 onChange 回调                                       │
+│  - 发送完整表单状态到服务端重新构建                                       │
+│  - 服务端返回新的 FormState（无错误状态）                                │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  阶段 4：MERGE_SERVER_STATE → 状态对齐                                   │
+│  ───────────────────────────────────────                                │
+│  - mergeServerFormState 合并服务端状态                                   │
+│  - 清除 errorPaths（服务端状态无 errorPaths）                            │
+│  - 恢复 valid = true, passesCondition = true                            │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  阶段 5：再次提交 → 提交前全量验证                                        │
+│  ───────────────────────────────────────                                │
+│  - validateForm 遍历所有字段                                             │
+│  - event = 'submit' 的客户端验证                                         │
+│  - REPLACE_STATE 用最新验证结果替换                                      │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  阶段 6：提交成功 → 服务端权威状态覆盖                                    │
+│  ───────────────────────────────────────                                │
+│  - MERGE_SERVER_STATE (acceptValues = true)                             │
+│  - 服务端是权威，覆盖本地值                                               │
+│  - setSubmitted(false) 隐藏错误 UI                                       │
+│  - 客户端与服务端状态完全对齐                                            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.2 用户修正输入时的错误清除
+
+**触发源：** `useField` 中的节流验证
+
+**位置：** `packages/ui/src/forms/useField/index.tsx:135-224`
+
+当用户修改字段值时，`value` 作为依赖项变化，触发节流验证：
+
+```typescript
+// useField/index.tsx:135-224
+useThrottledEffect(
+  () => {
+    const validateField = async () => {
+      let valueToValidate = value
+
+      // ... 获取要验证的值
+
+      // 1. 初始值：使用上一次的错误状态
+      let errorMessage: string | undefined = prevErrorMessage.current
+      let valid: boolean | string = prevValid.current
+
+      const data = getData()
+      const isValid =
+        typeof validate === 'function'
+          ? await validate(valueToValidate, {
+              // ... 验证选项
+              event: 'onChange',  // 注意：是 onChange，不是 submit
+            })
+          : typeof prevErrorMessage.current === 'string'
+            ? prevErrorMessage.current
+            : prevValid.current
+
+      // 2. 根据验证结果更新状态
+      if (typeof isValid === 'string') {
+        valid = false
+        errorMessage = isValid
+      } else if (typeof isValid === 'boolean') {
+        valid = isValid
+        errorMessage = undefined  // 验证通过，清除错误消息
+      }
+
+      // 3. 仅在状态变化时 dispatch
+      if (valid !== prevValid.current || errorMessage !== prevErrorMessage.current) {
+        prevValid.current = valid
+        prevErrorMessage.current = errorMessage
+
+        const update: UPDATE = {
+          type: 'UPDATE',
+          errorMessage,  // 新的 errorMessage（可能是 undefined）
+          path,
+          valid,         // 新的 valid
+          value,
+        }
+
+        dispatchField(update)
+      }
+    }
+
+    void validateField()
+  },
+  150,
+  [value, ...]  // value 变化时触发
+)
+```
+
+**关键机制：**
+1. 验证函数使用 `event: 'onChange'`，但会重新评估所有验证逻辑
+2. 如果验证通过（`isValid === true`），`errorMessage` 被显式设为 `undefined`
+3. `UPDATE` action 用新状态覆盖旧状态（包括之前的服务端错误）
+
+### 10.3 UPDATE action 的状态更新
+
+**位置：** `packages/ui/src/forms/Form/fieldReducer.ts:398-442`
+
+```typescript
+case 'UPDATE': {
+  const newField = Object.entries(action).reduce(
+    (field, [key, value]) => {
+      if (
+        [
+          'disableFormData',
+          'errorMessage',  // ← 允许更新
+          'initialValue',
+          'rows',
+          'valid',         // ← 允许更新
+          'validate',
+          'value',
+        ].includes(key)
+      ) {
+        return {
+          ...field,
+          [key]: value,  // 新值覆盖旧值
+          ...(key === 'value' ? { isModified: true } : {}),
+        }
+      }
+      return field
+    },
+    state?.[action.path] || ({} as FormField),
+  )
+
+  const newState = {
+    ...state,
+    [action.path]: newField,  // 完全替换该字段的状态
+  }
+
+  return newState
+}
+```
+
+**状态覆盖示例：**
+
+假设之前服务端返回的错误状态：
+```typescript
+// 服务端错误后的状态
+{
+  'username': {
+    value: 'admin123',
+    valid: false,
+    errorMessage: '该用户名已被使用',
+    errorPaths: [],
+    // ...
+  }
+}
+```
+
+用户修改为 `admin456` 后，useField 验证通过：
+```typescript
+// UPDATE action 带来的新状态
+{
+  'username': {
+    value: 'admin456',
+    valid: true,            // ← 覆盖为 true
+    errorMessage: undefined, // ← 覆盖为 undefined（清除）
+    errorPaths: [],         // ← 保持不变（不会自动清除）
+    isModified: true,       // ← 新标记
+    // ...
+  }
+}
+```
+
+**注意：** `errorPaths` 不会被 `UPDATE` action 清除，因为它不在允许更新的 key 列表中。需要等待 `MERGE_SERVER_STATE` 来清除。
+
+### 10.4 onChange 防抖与服务端状态重建
+
+**位置：** `packages/ui/src/forms/Form/index.tsx:832-867`
+
+用户输入 250ms 后，触发 `onChange` 回调链：
+
+```typescript
+const executeOnChange = useEffectEvent((submitted: boolean) => {
+  queueTask(async () => {
+    if (Array.isArray(onChange)) {
+      let serverState: FormState
+
+      for (const onChangeFn of onChange) {
+        // Edit view 的 onChange 会调用 getFormState
+        serverState = await onChangeFn({
+          formState: deepCopyObjectSimpleWithoutReactComponents(formState, {
+            excludeFiles: true,
+          }),
+          submitted,
+        })
+      }
+
+      // 用服务端返回的新状态合并
+      dispatchFields({
+        type: 'MERGE_SERVER_STATE',
+        prevStateRef: prevFormState,
+        serverState,
+      })
+    }
+  })
+})
+
+// 防抖 250ms
+useDebouncedEffect(
+  () => {
+    if ((isFirstRenderRef.current || !dequal(formState, prevFormState.current)) && modified) {
+      executeOnChange(submitted)
+    }
+    prevFormState.current = formState
+    isFirstRenderRef.current = false
+  },
+  [modified, submitted, formState],
+  250,  // 防抖时间
+)
+```
+
+### 10.5 MERGE_SERVER_STATE 的状态合并
+
+**位置：** `packages/ui/src/forms/Form/mergeServerFormState.ts:82-238`
+
+服务端返回的新 FormState 会通过 `mergeServerFormState` 合并到客户端：
+
+```typescript
+export const mergeServerFormState = ({
+  acceptValues,
+  currentState = {},
+  incomingState,
+}: Args): FormState => {
+  const newState = { ...currentState }
+
+  for (const [path, incomingField] of Object.entries(incomingState || {})) {
+    // ... 值合并逻辑（见下文）
+
+    newState[path] = {
+      ...currentState[path],
+      ...sanitizedIncomingField,
+    }
+
+    // 关键：清除 errorPaths
+    // 如果当前状态有 errorPaths，但服务端状态没有，说明错误已解决
+    if (
+      currentState[path] &&
+      'errorPaths' in currentState[path] &&
+      !('errorPaths' in incomingField)
+    ) {
+      newState[path].errorPaths = []  // ← 清除历史错误路径
+    }
+
+    // 如果服务端不标记为 false，就认为是 true
+    if (incomingField.valid !== false) {
+      newState[path].valid = true  // ← 确保 valid 为 true
+    }
+
+    if (incomingField.passesCondition !== false) {
+      newState[path].passesCondition = true  // ← 确保条件通过
+    }
+  }
+
+  return dequal(newState, currentState) ? currentState : newState
+}
+```
+
+**mergeServerFormState 的清除效果：**
+
+```typescript
+// 合并前的客户端状态（有历史错误标记）
+{
+  'username': {
+    value: 'admin456',
+    valid: true,           // 已被 useField 更新
+    errorMessage: undefined, // 已被清除
+    errorPaths: [],        // 空数组
+    isModified: true,
+  }
+}
+
+// 服务端返回的状态（干净状态）
+{
+  'username': {
+    value: 'admin456',
+    valid: true,
+    passesCondition: true,
+    // 没有 errorMessage, errorPaths
+  }
+}
+
+// 合并后的状态
+{
+  'username': {
+    value: 'admin456',
+    valid: true,
+    passesCondition: true,
+    errorPaths: [],        // 被清除
+    isModified: true,      // 保留本地修改标记
+  }
+}
+```
+
+### 10.6 再次提交前的全量验证
+
+用户点击保存后，提交流程会先执行全量验证：
+
+**位置：** `packages/ui/src/forms/Form/index.tsx:177-246`
+
+```typescript
+const validateForm = useCallback(async () => {
+  const validatedFieldState = {}
+  let isValid = true
+
+  const data = contextRef.current.getData()
+
+  // 遍历所有字段
+  const validationPromises = Object.entries(contextRef.current.fields).map(
+    async ([path, field]) => {
+      const validatedField = field
+
+      if (field.passesCondition !== false) {
+        let validationResult: boolean | string = validatedField.valid
+
+        if ('validate' in field && typeof field.validate === 'function') {
+          // 重新验证
+          validationResult = await field.validate(valueToValidate, {
+            // ...
+            event: 'submit',  // 注意：这里是 'submit'
+          })
+
+          if (typeof validationResult === 'string') {
+            validatedField.errorMessage = validationResult
+            validatedField.valid = false
+          } else {
+            validatedField.valid = true
+            validatedField.errorMessage = undefined  // 确保清除
+          }
+        }
+
+        if (validatedField.valid === false) {
+          isValid = false
+        }
+      }
+
+      validatedFieldState[path] = validatedField
+    },
+  )
+
+  await Promise.all(validationPromises)
+
+  // 用 REPLACE_STATE 完全替换表单状态
+  if (!dequal(contextRef.current.fields, validatedFieldState)) {
+    dispatchFields({ type: 'REPLACE_STATE', state: validatedFieldState })
+  }
+
+  setIsValid(isValid)
+  return isValid
+}, [...])
+```
+
+**关键差异：**
+- `validateForm` 使用 `event: 'submit'`（虽然是在客户端执行）
+- 用 `REPLACE_STATE` 完全替换，而不是部分更新
+- 验证通过时显式设置 `errorMessage = undefined`
+
+### 10.7 提交成功后的状态对齐
+
+**位置：** `packages/ui/src/forms/Form/index.tsx:431-455`
+
+```typescript
+if (res.status < 400) {
+  if (typeof onSuccess === 'function') {
+    const newFormState = await onSuccess(json, {
+      context,
+      formState: serializableFormState,
+    })
+
+    if (newFormState) {
+      dispatchFields({
+        type: 'MERGE_SERVER_STATE',
+        acceptValues: true,  // 关键：acceptValues = true
+        prevStateRef: prevFormState,
+        serverState: newFormState,
+      })
+    }
+  }
+
+  setSubmitted(false)  // 关键：隐藏错误 UI
+  setProcessing(false)
+  // ...
+}
+```
+
+**acceptValues = true 的含义：**
+
+在 `mergeServerFormState` 中：
+```typescript
+let shouldAcceptValue =
+  incomingField.addedByServer ||
+  acceptValues === true ||  // ← 这里为 true
+  // ...
+```
+
+**效果：**
+- 服务端返回的所有值都会被接受（覆盖本地值）
+- 服务端是权威状态
+- 客户端状态被重置为服务端的最新状态
+
+**完整的状态重置：**
+
+```typescript
+// 提交前的状态（可能有本地修改标记）
+{
+  'username': {
+    value: 'admin456',
+    valid: true,
+    isModified: true,      // 本地修改标记
+    errorPaths: [],
+  }
+}
+
+// 服务端返回的状态（权威状态）
+{
+  'username': {
+    value: 'admin456',
+    initialValue: 'admin456',  // 最新的初始值
+    valid: true,
+    passesCondition: true,
+  }
+}
+
+// 合并后的状态（acceptValues = true）
+{
+  'username': {
+    value: 'admin456',
+    initialValue: 'admin456',  // 从服务端同步
+    valid: true,
+    passesCondition: true,
+    errorPaths: [],
+    // isModified 可能被清除（依赖 mergeServerFormState 逻辑）
+  }
+}
+
+// 同时设置：
+// submitted: false  → 错误 UI 隐藏
+// modified: false   → 不再显示未保存更改
+```
+
+### 10.8 恢复链路完整示例
+
+让我们用之前的**用户名唯一性场景**演示完整的恢复链路：
+
+#### 初始失败状态
+```
+服务端：username='admin123' 已存在
+客户端：
+  - valid: false
+  - errorMessage: '该用户名已被使用'
+  - submitted: true  (显示错误)
+  - modified: true   (可重试)
+```
+
+#### 阶段 1-2：用户修正输入
+```
+用户操作：将 username 改为 'admin456'
+
+触发：useField 节流验证 (150ms 后)
+  - validate('admin456', { event: 'onChange' })
+  - 格式检查通过，数据库检查被跳过 (event !== 'submit')
+  - 结果：isValid = true
+
+UPDATE action：
+  - username.valid = true
+  - username.errorMessage = undefined
+  - username.isModified = true
+
+当前状态：
+  - valid: true ✓
+  - errorMessage: undefined ✓
+  - submitted: true (仍显示 UI，但错误消息为空)
+  - errorPaths: [] (未被 UPDATE 清除，但已空)
+```
+
+#### 阶段 3-4：onChange 服务端重建
+```
+触发：防抖 250ms 后
+  - onChange 回调 → getFormState (RSC)
+  - 服务端重新构建表单状态
+
+服务端返回：
+  - username.valid = true
+  - 无 errorMessage
+  - 无 errorPaths
+
+MERGE_SERVER_STATE：
+  - username.errorPaths = [] (显式清除)
+  - username.valid = true (确认)
+  - username.passesCondition = true (确认)
+
+当前状态：
+  - 完全干净的验证状态
+  - 仅保留 isModified = true
+```
+
+#### 阶段 5：再次提交
+```
+用户操作：点击保存
+
+触发：validateForm (提交前全量验证)
+  - 遍历所有字段
+  - validate('admin456', { event: 'submit' })
+    - 注意：客户端无数据库访问，可能通过
+    - 或使用新值后服务端逻辑
+
+如果客户端验证通过：
+  - REPLACE_STATE 替换为全量验证结果
+  - 发送请求到服务端
+```
+
+#### 阶段 6：提交成功
+```
+服务端：
+  - beforeChange 验证
+    - validate('admin456', { event: 'submit' })
+    - 数据库检查：admin456 不存在 ✓
+  - 持久化成功
+
+客户端：
+  - res.status = 200
+  - MERGE_SERVER_STATE (acceptValues = true)
+    - 服务端权威状态覆盖
+  - setSubmitted(false)  → 错误 UI 隐藏
+  - setModified(false)   → 保存按钮变灰
+
+最终状态：
+  - 客户端与服务端完全对齐
+  - 无错误状态
+  - 可进行下一次编辑
+```
+
+### 10.9 恢复链路的关键保证
+
+| 保证维度 | 触发时机 | 机制 | 关键文件 |
+|---------|---------|------|---------|
+| **errorMessage 清除** | 用户输入后 150ms | useField 节流验证 → UPDATE | useField/index.tsx:135-224 |
+| **valid 状态恢复** | 用户输入后 150ms | useField 节流验证 → UPDATE | useField/index.tsx:172-202 |
+| **errorPaths 清除** | onChange 防抖后 | MERGE_SERVER_STATE | mergeServerFormState.ts:148-154 |
+| **全量重新验证** | 点击保存时 | validateForm → REPLACE_STATE | Form/index.tsx:177-246 |
+| **UI 状态重置** | 提交成功后 | setSubmitted(false) | Form/index.tsx:448 |
+| **值权威对齐** | 提交成功后 | MERGE_SERVER_STATE (acceptValues=true) | mergeServerFormState.ts:100-108 |
+
+### 10.10 潜在问题与注意事项
+
+1. **errorPaths 清除延迟**
+   - UPDATE action 不会清除 errorPaths
+   - 需等待 onChange 250ms 防抖后的 MERGE_SERVER_STATE
+   - 影响：errorPaths 短暂残留（但通常不影响 UI）
+
+2. **客户端与服务端 validate 的 event 差异**
+   - validateForm 使用 `event: 'submit'`，但在客户端执行
+   - 如果验证函数依赖 `req.payload.db` 等服务端特性，仍会跳过
+   - 影响：提交前可能仍无法发现服务端才会检测的问题
+
+3. **isModified 状态**
+   - 服务端成功后，modified 被设为 false
+   - 但如果 onSuccess 回调返回的状态包含 isModified，行为可能不同
+
+## 11. 结论
 
 Payload CMS 的自定义字段验证采用**"单点定义，多点执行"**的策略：
 
