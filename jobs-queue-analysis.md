@@ -1092,6 +1092,739 @@ jobs: {
 }
 ```
 
+#### 1.3.10 隐性风险三：跨实例并发时整块回写导致的 Last-Write-Wins 覆盖
+
+**问题描述**：
+
+在多实例（多 Worker / 多 Pod）环境中，多个实例可能同时触发 `handleSchedules`。每个实例都：
+1. 在开始时读取一次 `stats` 快照
+2. 在 `defaultAfterSchedule` 中基于这份**陈旧的快照**构建完整的新对象
+3. 调用 `updateGlobal` **整块替换** `scheduledRuns`
+
+这导致典型的 **Read-Modify-Write (RMW) 竞争条件**，后写入的实例会覆盖先写入实例的所有更新。
+
+**代码证据**：
+
+```typescript
+// 关键 1：handleSchedules 在开始时只读取一次快照
+// packages/payload/src/queues/operations/handleSchedules/index.ts:60-63
+const stats: JobStats = await req.payload.db.findGlobal({
+  slug: jobStatsGlobalSlug,
+  req,
+})
+
+// 关键 2：defaultAfterSchedule 基于旧快照构建完整对象
+// packages/payload/src/queues/operations/handleSchedules/defaultAfterSchedule.ts:28-47
+if (jobStats) {  // jobStats 是 handleSchedules 开始时读取的快照
+  await req.payload.db.updateGlobal({
+    slug: jobStatsGlobalSlug,
+    data: {
+      ...(jobStats || {}),  // ← 整块展开旧快照
+      stats: {
+        ...(jobStats?.stats || {}),  // ← 旧快照
+        scheduledRuns: {
+          ...(jobStats?.stats?.scheduledRuns || {}),  // ← 旧快照
+          queues: {
+            ...(jobStats?.stats?.scheduledRuns?.queues || {}),  // ← 旧快照
+            [queueable.scheduleConfig.queue]: queueConfig,  // 只更新了当前 queue
+          },
+        },
+      },
+      updatedAt: getCurrentDate().toISOString(),
+    } as JobStats,
+    req,
+    returning: false,
+  })
+}
+
+// 关键 3：updateGlobal 整块替换，不是增量合并
+// packages/payload/src/globals/operations/update.ts:358-364
+if (globalExists) {
+  result = await payload.db.updateGlobal({
+    slug,
+    data: result,  // ← 整块替换
+    req,
+    select,
+  })
+}
+```
+
+**关键发现**：
+- `stats` 字段是 `type: 'json'`（`global.ts:45`）
+- `updateGlobal` 没有做 `stats` 字段的增量合并
+- `defaultAfterSchedule` 基于旧快照展开，导致 RMW 竞争
+- 即使在同一个 `handleSchedules` 调用内，多个调度项也会互相覆盖（已在 1.3.8 分析）
+
+---
+
+**跨实例时序推演**：
+
+**场景**：两个实例（Worker-A 和 Worker-B）在同一时间点处理不同队列的调度
+
+```
+初始状态（数据库）：
+{
+  stats: {
+    scheduledRuns: {
+      queues: {
+        queueA: { tasks: { taskA: { lastScheduledRun: '08:00' } } },
+        queueB: { tasks: { taskB: { lastScheduledRun: '08:00' } } },
+      }
+    }
+  }
+}
+```
+
+```
+时序推演：
+
+T0: Worker-A 读取 stats 快照 S_A
+    S_A = { queueA: { taskA: 08:00 }, queueB: { taskB: 08:00 } }
+
+T0: Worker-B 读取 stats 快照 S_B（同时发生）
+    S_B = { queueA: { taskA: 08:00 }, queueB: { taskB: 08:00 } }
+
+T1: Worker-A 处理 queueA 的 taskA
+    → beforeSchedule 通过
+    → 入队成功
+    → defaultAfterSchedule 开始：
+      existingQueuesConfig = S_A.queues[queueA] = { taskA: 08:00 }
+      queueConfig = { tasks: { taskA: { lastScheduledRun: 08:30 } } }
+      构建 data：
+        {
+          stats: {
+            scheduledRuns: {
+              queues: {
+                ...S_A.stats.scheduledRuns.queues,  // queueA + queueB（旧值）
+                queueA: { tasks: { taskA: 08:30 } },  // 只更新 queueA
+              }
+            }
+          }
+        }
+    → 调用 updateGlobal，写入 DB
+
+T1.5: 数据库（Worker-A 写入后）：
+    {
+      stats: {
+        scheduledRuns: {
+          queues: {
+            queueA: { tasks: { taskA: 08:30 } },
+            queueB: { tasks: { taskB: 08:00 } },  // ← 用的是 S_A 的旧值，但碰巧正确
+          }
+        }
+      }
+    }
+
+T2: Worker-B 处理 queueB 的 taskB
+    → beforeSchedule 通过
+    → 入队成功
+    → defaultAfterSchedule 开始：
+      existingQueuesConfig = S_B.queues[queueB] = { taskB: 08:00 }  // ← S_B 还是旧快照！
+      queueConfig = { tasks: { taskB: { lastScheduledRun: 08:31 } } }
+      构建 data：
+        {
+          stats: {
+            scheduledRuns: {
+              queues: {
+                ...S_B.stats.scheduledRuns.queues,  // queueA: taskA: 08:00（旧值！）
+                queueB: { tasks: { taskB: 08:31 } },
+              }
+            }
+          }
+        }
+    → 调用 updateGlobal，写入 DB
+
+T3: 数据库（Worker-B 写入后）：
+    {
+      stats: {
+        scheduledRuns: {
+          queues: {
+            queueA: { tasks: { taskA: 08:00 } },  // ← 被 Worker-B 用 S_B 的旧值覆盖！
+            queueB: { tasks: { taskB: 08:31 } },
+          }
+        }
+      }
+    }
+
+最终结果：
+- Worker-A 的更新（queueA: 08:30）被完全覆盖丢失
+- Worker-B 基于 S_B 的旧快照写入，queueA 回退到 08:00
+```
+
+---
+
+**丢失模式分类**：
+
+根据竞争发生的维度，可分为以下三类丢失模式：
+
+| 模式编号 | 竞争维度 | 描述 | 发生概率 | 严重程度 |
+|---------|---------|------|---------|---------|
+| **M1** | **同实例、同 handleSchedules 调用内** | 多个调度项串行执行，但都基于初始快照 S0 | 高 | 中 |
+| **M2** | **跨实例、异 queue / 异 task** | 不同实例处理不同队列/任务 | 中 | 高 |
+| **M3** | **同 slug、多条 schedule** | 同一 task/workflow 的多条 schedule | 低 | 高 |
+
+**详细分析每种模式**：
+
+---
+
+**模式 M1：同实例、同 handleSchedules 调用内**
+
+已在 1.3.8 详细分析，这里补充跨实例视角：
+
+```
+同一 handleSchedules 调用内的竞争：
+
+快照 S0 = { queueA: taskA, queueB: taskB }
+
+处理顺序：
+1. taskA 完成 → 写入 { queueA: taskA', queueB: taskB }  ← S0 展开
+2. taskB 完成 → 写入 { queueA: taskA, queueB: taskB' }   ← 还是 S0 展开！
+
+结果：taskA 的更新被覆盖
+```
+
+---
+
+**模式 M2：跨实例、异 queue / 异 task**
+
+最常见也最危险的模式。
+
+**完整时序推演**：
+
+```
+配置：
+- Worker-A 处理 queueA: taskA（每 30 分钟）
+- Worker-B 处理 queueB: taskB（每 30 分钟）
+
+初始：
+queueA.taskA.lastScheduledRun = 08:00
+queueB.taskB.lastScheduledRun = 08:00
+
+时间线：
+
+T0 (08:30:00.100): Worker-A 触发 handleSchedules
+   → 读取 S_A = { queueA: 08:00, queueB: 08:00 }
+   → 检查 queueA.taskA：nextRun = 08:30，应该触发
+
+T0 (08:30:00.150): Worker-B 触发 handleSchedules（并发）
+   → 读取 S_B = { queueA: 08:00, queueB: 08:00 }
+   → 检查 queueB.taskB：nextRun = 08:30，应该触发
+
+T1 (08:30:00.200): Worker-A 入队成功
+   → defaultAfterSchedule：
+     data = {
+       stats: {
+         scheduledRuns: {
+           queues: {
+             ...S_A.stats.scheduledRuns.queues,  // queueA:08:00, queueB:08:00
+             queueA: { tasks: { taskA: { lastScheduledRun: 08:30 } } }
+           }
+         }
+       }
+     }
+   → updateGlobal 写入 DB
+
+T1 (08:30:00.210): 数据库状态 A：
+   queueA.taskA = 08:30 ✓
+   queueB.taskB = 08:00（来自 S_A 的旧值）
+
+T2 (08:30:00.300): Worker-B 入队成功
+   → defaultAfterSchedule：
+     data = {
+       stats: {
+         scheduledRuns: {
+           queues: {
+             ...S_B.stats.scheduledRuns.queues,  // queueA:08:00, queueB:08:00 ← S_B 还是旧的！
+             queueB: { tasks: { taskB: { lastScheduledRun: 08:30 } } }
+           }
+         }
+       }
+     }
+   → updateGlobal 写入 DB
+
+T2 (08:30:00.310): 数据库状态 B（最终）：
+   queueA.taskA = 08:00 ← 被覆盖！❌
+   queueB.taskB = 08:30 ✓
+
+影响：
+- 下次 Worker-A 计算 nextRun：
+  Cron('*/30').nextRun(08:00) = 08:30（过去时间，仍会触发）
+  → 可能重复入队！
+```
+
+---
+
+**模式 M3：同 slug、多条 schedule**
+
+已在 1.3.9 部分分析，这里补充跨实例视角：
+
+```
+配置：
+taskA 配置了两条 schedule：
+  #1: cron '0 8 * * *'（每天 8:00）
+  #2: cron '0 20 * * *'（每天 20:00）
+
+存储结构缺陷：
+queues.default.tasks.taskA = { lastScheduledRun: ... }
+  ← 没有区分 schedule #1 和 #2
+
+跨实例时序：
+
+Worker-A（处理 schedule #1）：
+  读取 S_A.tasks.taskA.lastScheduledRun = 08:00（昨天 #1 的时间）
+  计算 nextRun = 今天 08:00（现在）
+  入队成功
+  写入 lastScheduledRun = 今天 08:00
+
+Worker-B（处理 schedule #2，并发）：
+  读取 S_B.tasks.taskA.lastScheduledRun = 08:00（昨天 #1 的时间）
+  计算 nextRun = Cron('0 20 * * *').nextRun(昨天 08:00) = 昨天 20:00（过去）
+  入队成功（补跑昨天 20:00）
+  写入 lastScheduledRun = 现在（今天 08:xx）
+
+Worker-B 写入后：
+  taskA.lastScheduledRun = 今天 08:xx
+
+Worker-A 计算下一次：
+  nextRun = Cron('0 8 * * *').nextRun(今天 08:xx) = 明天 08:00 ✓
+
+Worker-B 计算下一次：
+  nextRun = Cron('0 20 * * *').nextRun(今天 08:xx) = 今天 20:00 ✓
+
+看似正常... 但如果系统停机恢复：
+
+停机前：
+  #1 最后运行：今天 08:00
+  #2 最后运行：昨天 20:00
+  lastScheduledRun 被 #1 覆盖为 今天 08:00
+
+恢复时：
+  两个实例都读取 lastScheduledRun = 今天 08:00
+  #1: nextRun = 明天 08:00（正确）
+  #2: nextRun = 今天 20:00（本来应该昨天 20:00，被跳过！）
+```
+
+---
+
+**修复策略优先级**：
+
+| 优先级 | 策略 | 适用场景 | 改动范围 | 实施难度 |
+|-------|------|---------|---------|---------|
+| **P0（立即）** | **单实例处理调度** | 所有生产环境 | 配置/部署 | 低 |
+| **P1（短期）** | **自定义 afterSchedule：增量更新** | 需要多实例调度 | 用户代码 | 中 |
+| **P2（中期）** | **在 defaultAfterSchedule 中重新读取最新 stats** | 单实例内多调度项 | Payload 核心 | 低 |
+| **P3（长期）** | **数据库级乐观锁（version/etag）** | 所有场景 | Payload 核心 | 高 |
+| **P4（理想）** | **按 cron 区分进度（修复 M3）** | 同 slug 多条 schedule | Payload 核心 | 中 |
+
+---
+
+**P0：单实例处理调度（立即实施）**
+
+**最简单、最可靠的方案**：不要让多个实例同时处理调度。
+
+```yaml
+# docker-compose.yml 推荐配置
+services:
+  # 主服务：不处理调度
+  nextjs:
+    command: pnpm start
+    environment:
+      - ENABLE_JOB_WORKERS=true
+      - ENABLE_JOB_SCHEDULING=false  # 主服务不调度
+
+  # Worker 1：同时处理执行和调度
+  worker-1:
+    command: pnpm payload jobs:run --cron "*/5 * * * *" --queue default --handle-schedules
+    restart: always
+
+  # Worker 2：只处理执行，不调度
+  worker-2:
+    command: pnpm payload jobs:run --cron "*/5 * * * *" --queue default
+    restart: always
+```
+
+**或通过 shouldAutoSchedule 控制**：
+
+```typescript
+jobs: {
+  shouldAutoRun: async (payload) => {
+    return process.env.ENABLE_JOB_WORKERS === 'true'
+  },
+  shouldAutoSchedule: async (payload) => {
+    // 只有特定实例处理调度
+    return process.env.INSTANCE_ID === 'scheduler-1'
+      && process.env.ENABLE_JOB_SCHEDULING === 'true'
+  },
+}
+```
+
+---
+
+**P1：自定义 afterSchedule 增量更新（短期）**
+
+**不修改 Payload 源码，通过自定义钩子实现**。
+
+```typescript
+import type { AfterScheduleFn } from 'payload'
+import { getCurrentDate } from 'payload/utilities'
+import { jobStatsGlobalSlug } from 'payload/queues'
+
+const atomicAfterSchedule: AfterScheduleFn = async ({ queueable, status, req }) => {
+  if (status !== 'success') return  // 只在成功入队时更新
+
+  const queue = queueable.scheduleConfig.queue
+  const taskSlug = queueable.taskConfig?.slug
+  const workflowSlug = queueable.workflowConfig?.slug
+  const now = getCurrentDate().toISOString()
+
+  // 关键：在事务内读取最新状态后立即更新
+  // 注意：Payload 的 updateGlobal 不是增量的，我们需要手动构建增量
+  // 但我们可以通过"重试+验证"模式减少竞争窗口
+
+  let attempts = 0
+  const maxAttempts = 3
+
+  while (attempts < maxAttempts) {
+    attempts++
+
+    // 1. 读取最新状态
+    const currentStats = await req.payload.db.findGlobal({
+      slug: jobStatsGlobalSlug,
+      req,
+    })
+
+    // 2. 基于最新状态构建新数据
+    const queues = currentStats?.stats?.scheduledRuns?.queues || {}
+    const queueConfig = queues[queue] || {}
+
+    if (taskSlug) {
+      queueConfig.tasks = {
+        ...queueConfig.tasks,
+        [taskSlug]: { lastScheduledRun: now },
+      }
+    } else if (workflowSlug) {
+      queueConfig.workflows = {
+        ...queueConfig.workflows,
+        [workflowSlug]: { lastScheduledRun: now },
+      }
+    }
+
+    const newQueues = {
+      ...queues,
+      [queue]: queueConfig,
+    }
+
+    // 3. 写入
+    await req.payload.db.updateGlobal({
+      slug: jobStatsGlobalSlug,
+      data: {
+        ...currentStats,
+        stats: {
+          ...currentStats?.stats,
+          scheduledRuns: {
+            ...currentStats?.stats?.scheduledRuns,
+            queues: newQueues,
+          },
+        },
+        updatedAt: now,
+      },
+      req,
+      returning: false,
+    })
+
+    // 4. 验证（可选，增加一致性保证）
+    const verifyStats = await req.payload.db.findGlobal({
+      slug: jobStatsGlobalSlug,
+      req,
+    })
+
+    const verifiedTime = taskSlug
+      ? verifyStats?.stats?.scheduledRuns?.queues?.[queue]?.tasks?.[taskSlug]?.lastScheduledRun
+      : verifyStats?.stats?.scheduledRuns?.queues?.[queue]?.workflows?.[workflowSlug]?.lastScheduledRun
+
+    if (verifiedTime === now) {
+      return  // 成功
+    }
+
+    // 竞争检测到，重试
+    req.payload.logger.warn(
+      `[atomicAfterSchedule] Detected concurrent update, retry ${attempts}/${maxAttempts}`
+    )
+  }
+
+  req.payload.logger.error(
+    `[atomicAfterSchedule] Failed after ${maxAttempts} attempts, possible data loss`
+  )
+}
+
+// 使用自定义钩子
+jobs: {
+  tasks: [{
+    slug: 'dailyDigest',
+    schedule: [{
+      cron: '0 8 * * *',
+      queue: 'daily',
+      hooks: {
+        afterSchedule: atomicAfterSchedule,
+      },
+    }],
+    handler: ...
+  }]
+}
+```
+
+---
+
+**P2：修复 defaultAfterSchedule（中期，贡献 Payload）**
+
+修改 `defaultAfterSchedule`，在每次更新前重新读取最新 `stats`：
+
+```typescript
+// 修复后的 defaultAfterSchedule（建议提交 PR）
+export const fixedDefaultAfterSchedule: AfterScheduleFn = async ({ queueable, req }) => {
+  // 关键改动：每次都读取最新状态，而不是使用传入的旧快照
+  const currentStats = await req.payload.db.findGlobal({
+    slug: jobStatsGlobalSlug,
+    req,
+  })
+
+  const queue = queueable.scheduleConfig.queue
+  const now = getCurrentDate().toISOString()
+
+  const existingQueuesConfig =
+    currentStats?.stats?.scheduledRuns?.queues?.[queue] || {}
+
+  const queueConfig: JobStatsScheduledRuns = {
+    ...existingQueuesConfig,
+  }
+
+  if (queueable.taskConfig) {
+    ;(queueConfig.tasks ??= {})[queueable.taskConfig.slug] = {
+      lastScheduledRun: now,
+    }
+  } else if (queueable.workflowConfig) {
+    ;(queueConfig.workflows ??= {})[queueable.workflowConfig.slug] = {
+      lastScheduledRun: now,
+    }
+  }
+
+  if (currentStats) {
+    await req.payload.db.updateGlobal({
+      slug: jobStatsGlobalSlug,
+      data: {
+        ...currentStats,  // 使用最新读取的，不是旧快照
+        stats: {
+          ...currentStats?.stats,
+          scheduledRuns: {
+            ...currentStats?.stats?.scheduledRuns,
+            queues: {
+              ...currentStats?.stats?.scheduledRuns?.queues,
+              [queue]: queueConfig,
+            },
+          },
+        },
+        updatedAt: now,
+      },
+      req,
+      returning: false,
+    })
+  } else {
+    await req.payload.db.createGlobal({
+      slug: jobStatsGlobalSlug,
+      data: {
+        createdAt: now,
+        stats: {
+          scheduledRuns: {
+            queues: {
+              [queue]: queueConfig,
+            },
+          },
+        },
+      },
+      req,
+      returning: false,
+    })
+  }
+}
+```
+
+**注意**：这只能缓解同实例内的竞争（M1），对跨实例竞争（M2）只有部分缓解效果（缩短竞争窗口）。
+
+---
+
+**P3：数据库级乐观锁（长期）**
+
+在 `payload-jobs-stats` 中添加版本号，实现真正的乐观锁：
+
+```typescript
+// 建议的数据结构
+type JobStatsWithVersion = {
+  version: number  // 乐观锁版本号
+  stats?: {
+    scheduledRuns?: {
+      queues?: {
+        [queueSlug: string]: {
+          tasks?: {
+            [taskSlug: string]: {
+              lastScheduledRun: string
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// 更新逻辑
+async function updateWithOptimisticLock({ queue, taskSlug, newValue, req }) {
+  let retries = 0
+  const maxRetries = 5
+
+  while (retries < maxRetries) {
+    retries++
+
+    // 1. 读取当前版本
+    const current = await req.payload.db.findGlobal({ slug: 'payload-jobs-stats', req })
+    const currentVersion = current?.version || 0
+
+    // 2. 构建更新
+    const update = {
+      ...current,
+      version: currentVersion + 1,  // 递增版本
+      stats: {
+        ...current?.stats,
+        scheduledRuns: {
+          ...current?.stats?.scheduledRuns,
+          queues: {
+            ...current?.stats?.scheduledRuns?.queues,
+            [queue]: {
+              ...current?.stats?.scheduledRuns?.queues?.[queue],
+              tasks: {
+                ...current?.stats?.scheduledRuns?.queues?.[queue]?.tasks,
+                [taskSlug]: newValue,
+              },
+            },
+          },
+        },
+      },
+    }
+
+    // 3. 条件更新（仅当 version 匹配时）
+    // 这需要 Payload 支持条件更新，或直接使用原生数据库查询
+    const result = await req.payload.db.updateGlobal({
+      slug: 'payload-jobs-stats',
+      data: update,
+      where: { version: { equals: currentVersion } },  // 条件更新（需 Payload 支持）
+      req,
+    })
+
+    if (result) {
+      return  // 成功
+    }
+    // 版本不匹配，重试
+  }
+
+  throw new Error('Concurrent update conflict after max retries')
+}
+```
+
+---
+
+**P4：按 cron 区分进度（理想）**
+
+修复 M3 模式，按 `cron` 表达式区分同 slug 的多条 schedule：
+
+```typescript
+// 新的存储结构
+type JobStatsPerCron = {
+  stats?: {
+    scheduledRuns?: {
+      queues?: {
+        [queueSlug: string]: {
+          tasks?: {
+            [taskSlug: string]: {
+              schedules: {
+                [cronExpr: string]: {  // ← 按 cron 区分
+                  lastScheduledRun: string
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// 使用示例
+jobs: {
+  tasks: [{
+    slug: 'reportTask',
+    schedule: [
+      { cron: '0 8 * * *', queue: 'daily' },   // #1
+      { cron: '0 20 * * *', queue: 'daily' },  // #2
+    ],
+    handler: ...
+  }]
+}
+
+// 存储示例
+{
+  stats: {
+    scheduledRuns: {
+      queues: {
+        daily: {
+          tasks: {
+            reportTask: {
+              schedules: {
+                '0 8 * * *': { lastScheduledRun: '2026-05-11T08:00:00Z' },   // #1 独立记录
+                '0 20 * * *': { lastScheduledRun: '2026-05-10T20:00:00Z' }, // #2 独立记录
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+**推荐实施路线图**：
+
+```
+阶段 1（今天）：
+- 部署配置修改：单实例处理调度（P0）
+- 影响：0 代码改动，立即消除 M2 模式
+
+阶段 2（本周）：
+- 自定义 afterSchedule：重试+验证模式（P1）
+- 影响：用户代码，缓解所有模式
+
+阶段 3（本月）：
+- 给 Payload 提交 PR：修复 defaultAfterSchedule（P2）
+- 影响：Payload 核心，缓解 M1
+
+阶段 4（本季度）：
+- 给 Payload 提交 RFC：数据库乐观锁（P3）
+- 影响：Payload 核心，彻底解决 M1/M2
+
+阶段 5（未来）：
+- 给 Payload 提交 RFC：按 cron 区分进度（P4）
+- 影响：Payload 核心，解决 M3
+```
+
+---
+
+**风险矩阵总结**：
+
+| 模式 | 竞争维度 | 触发条件 | 丢失内容 | P0 可避免 | P1 可缓解 |
+|------|---------|---------|---------|----------|----------|
+| **M1** | 同实例多调度项 | 同队列多任务 | 其他任务的更新 | ❌ | ✓ |
+| **M2** | 跨实例异队列 | 多实例同时调度 | 其他队列的更新 | ✓ | ✓ |
+| **M3** | 同 slug 多 schedule | 同任务多 cron | 其他 schedule 的进度 | ❌ | ⚠️ 部分 |
+
 ### 1.4 任务执行调度机制
 
 任务执行通过四种方式实现：
