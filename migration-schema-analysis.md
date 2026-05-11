@@ -4,7 +4,7 @@
 
 Payload CMS 支持五种数据库适配器：MongoDB、Postgres、SQLite、Vercel Postgres 和 D1 SQLite。本文档详细分析了这些适配器之间在数据库迁移和结构同步方面如何通过统一接口和抽象层来处理差异。
 
-**核心主线：连接层差异不改变结构同步结果。派生适配器（Vercel Postgres、D1 SQLite）通过组合模式复用父适配器的完整结构同步逻辑，仅在连接层做最小覆盖。
+**核心主线：连接层差异不改变结构同步结果。** 派生适配器（Vercel Postgres、D1 SQLite）通过组合模式复用父适配器的完整结构同步逻辑，仅在连接层做最小覆盖。
 
 ---
 
